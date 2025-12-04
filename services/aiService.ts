@@ -234,22 +234,31 @@ export const getTradingDecision = async (
   if (totalEquity < 20) {
       stageName = STRATEGY_STAGES.STAGE_1.name;
       currentStageParams = STRATEGY_STAGES.STAGE_1;
-      stagePromptAddition = "【起步搏杀阶段】当前资金较少，允许 **高风险高收益** 操作。如果出现确定性机会（如关键点位突破或重大利好），允许激进开仓以求快速翻倍。但仍需设置止损防止归零。";
+      stagePromptAddition = "【起步搏杀阶段】当前资金较少，允许 **高风险高收益** 操作。如果出现确定性机会，允许重仓。**但必须严守移动止损以保护本金。**";
   } else if (totalEquity < 80) {
       stageName = STRATEGY_STAGES.STAGE_2.name;
       currentStageParams = STRATEGY_STAGES.STAGE_2;
-      stagePromptAddition = "【资金积累阶段】风险偏好中等，追求稳健增长，注重回撤控制。";
+      stagePromptAddition = "【资金积累阶段】追求稳健增长，注重回撤控制，使用 trailing stop 锁定利润。";
   } else {
       stageName = STRATEGY_STAGES.STAGE_3.name;
       currentStageParams = STRATEGY_STAGES.STAGE_3;
-      stagePromptAddition = "【稳健盈利阶段】低风险偏好，保本第一，拒绝赌博式交易。";
+      stagePromptAddition = "【稳健盈利阶段】低风险偏好，保本第一。";
   }
 
   const hasPosition = !!primaryPosition && parseFloat(primaryPosition.pos) > 0;
   let positionStr = "当前无持仓 (Empty)";
+  let avgPx = 0;
+  let uplRatio = 0;
+  let upl = 0;
+  
   if (hasPosition) {
       const p = primaryPosition!;
-      positionStr = `持有 ${p.posSide} ${p.pos}张, 均价 ${p.avgPx}, 未结盈亏 ${p.upl} U`;
+      avgPx = parseFloat(p.avgPx);
+      upl = parseFloat(p.upl);
+      uplRatio = parseFloat(p.uplRatio) * 100;
+      positionStr = `持有 ${p.posSide} ${p.pos}张, 开仓均价 ${p.avgPx}, 未结盈亏 ${p.upl} U (${uplRatio.toFixed(2)}%)
+      当前止损价 (SL): ${p.slTriggerPx || "未设置"}
+      当前止盈价 (TP): ${p.tpTriggerPx || "未设置"}`;
   }
 
   // --- 4. 构建 Prompt (Rich Format) ---
@@ -285,30 +294,37 @@ ${marketDataBlock}
 - **阶段**: ${stageName}
 - **策略偏好**: ${stagePromptAddition}
 - **余额**: ${availableEquity.toFixed(2)} U
-- **持仓**: ${positionStr}
+- **持仓状态**: ${positionStr}
 
-**三、核心决策指令 (CRITICAL)**:
+**三、核心决策指令 (HIGHEST PRIORITY: PROFIT PROTECTION)**:
 
-1. **真实时事热点 (Real News Only)**:
-   - **严禁编造或使用“模拟”事件**。请基于你知识库中最新的 **真实** 币圈动态进行判断。
-   - **首要依据 (最近6小时)**: 检索记忆中最近6小时是否有影响ETH的重大新闻（如 ETF 资金流向、SEC 监管、Vitalik 言论、链上巨鲸异动）。
-   - **辅助依据 (最近24小时)**: 宏观情绪（美股关联、降息预期等）。
-   - 如果没有明确的短期重大新闻，请诚实回答“无重大短线热点”，并将决策权重完全回归 **技术面**。
+1. **利润保护与本金安全 (TPSL Priority)**:
+   - **最高优先级规则**: 如果持有仓位且有盈利，**首选动作是 UPDATE_TPSL (调整止损) 而不是 CLOSE (市价平仓)**。让利润奔跑，但锁住下行风险。
+   - **保本逻辑 (Break-Even)**: 只要浮盈超过 **0.5%** (足以覆盖双向手续费)，**必须** 将止损上移至 **开仓均价之上** (对于多单) 或 **开仓均价之下** (对于空单)，确保即使回调也不亏本金。
+   - **锁利逻辑 (Trailing Stop)**:
+     - 浮盈 > 10% -> 将止损上移至锁定 5% 利润的位置。
+     - 浮盈 > 20% -> 将止损上移至锁定 15% 利润的位置。
+   - **操作建议**: 只有当趋势发生 **根本性反转** 且来不及触发移动止损时，才使用 **CLOSE**。否则，请尽量使用 **UPDATE_TPSL** 来保护利润。
 
-2. **技术面研判 (超短线)**:
-   - 关注 **量价背离**: 价格新高但量比下降 (<0.8) 需警惕。
-   - 关注 **共振**: MACD 金叉 + 价格站上布林中轨 + RSI < 70 = 强买入信号。
-   - 起步期特权: 在 Stage 1，如果技术形态完美（如底部放量大阳线），即使无新闻也允许重仓博取反弹。
+2. **真实时事热点**:
+   - 仅基于真实 6小时/24小时 币圈新闻。严禁编造。
+   - 用google搜索非中文热点事件，用百度搜索中文热点事件。
+   - 若无重大新闻，回归技术面。
 
-3. **资金磨损控制与盈亏平衡 (Friction Control)**:
-   - **拒绝无效交易**: 在设定目标利润 (Profit Target) 时，必须考虑交易所的双向手续费（通常市价单约 0.1% - 0.12% 往返总成本）。
-   - **Break-Even 逻辑**: 你的“保本”操作不应仅仅是回到开仓价，而应是 **开仓价 + 手续费成本**。
-   - 仅当预期利润显著高于手续费磨损（例如预期盈利 > 0.5%）时才建议开仓。如果是微小的震荡（<0.3%），请选择 **HOLD** 以避免资金被手续费慢慢磨损。
+3. **技术面研判 (Entry Logic)**:
+   - 只有在盈亏比极佳时才开新仓。
+   - 关注量价背离和共振信号。
 
 4. **交易执行**:
    - **Action**: BUY / SELL / HOLD / CLOSE / UPDATE_TPSL
-   - **仓位**: 动态计算 (${currentStageParams.risk_factor * 100}% 仓位风险)。
-   - **止盈止损**: 必须给出具体数值。Stage 1 允许止损稍微放宽以容忍高波动，但严禁扛单。
+   - **Update TPSL**: 如果你决定保护利润，Action 选 **UPDATE_TPSL**，并在 stop_loss 字段填入新的具体价格。
+   - **Stop Loss 必填**: 开新仓必须带止损。
+
+**当前持仓数据参考**:
+- 开仓价: ${avgPx}
+- 当前价: ${currentPrice}
+- 收益率: ${uplRatio.toFixed(2)}%
+- 当前已设止损: ${hasPosition ? (primaryPosition?.slTriggerPx || "无") : "N/A"}
 
 请生成纯净的 JSON 格式交易决策。
 `;
@@ -316,7 +332,7 @@ ${marketDataBlock}
   const responseSchema = `
   {
     "stage_analysis": "...",
-    "hot_events_overview": "【6H真实热点】(无则填无)... 【24H真实热点】...",
+    "hot_events_overview": "...",
     "market_assessment": "...",
     "eth_analysis": "...", 
     "trading_decision": {
@@ -324,8 +340,8 @@ ${marketDataBlock}
       "confidence": "0-100%",
       "position_size": "动态计算",
       "leverage": "${currentStageParams.leverage}",
-      "profit_target": "价格",
-      "stop_loss": "价格",
+      "profit_target": "价格 (TP)",
+      "stop_loss": "价格 (SL - 重点关注此字段用于保本)",
       "invalidation_condition": "..."
     },
     "reasoning": "..."
@@ -335,7 +351,7 @@ ${marketDataBlock}
   try {
     const text = await callDeepSeek(apiKey, [
         { role: "system", content: systemPrompt + "\nJSON ONLY, NO MARKDOWN:\n" + responseSchema },
-        { role: "user", content: "基于真实数据分析，给出决策。" }
+        { role: "user", content: "基于当前持仓和市场数据，给出最优操作指令（优先考虑移动止损保护利润）。" }
     ]);
 
     if (!text) throw new Error("AI 返回为空");
@@ -359,13 +375,12 @@ ${marketDataBlock}
     
     // Robust Sizing Logic
     let targetMargin = availableEquity * currentStageParams.risk_factor * (confidence / 100);
-    const maxSafeMargin = availableEquity * 0.95; // Stage 1 允许用到 95% (留5%手续费)
+    const maxSafeMargin = availableEquity * 0.95; 
     let finalMargin = Math.min(targetMargin, maxSafeMargin);
 
     const MIN_OPEN_VALUE = 100;
     let positionValue = finalMargin * safeLeverage;
 
-    // 自动修正逻辑：如果钱不够 100U 名义价值，但属于 Stage 1 且置信度高，尝试用最大余额
     if (positionValue < MIN_OPEN_VALUE && availableEquity * 0.9 * safeLeverage > MIN_OPEN_VALUE) {
         if (confidence >= 40) {
              finalMargin = MIN_OPEN_VALUE / safeLeverage;
