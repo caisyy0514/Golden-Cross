@@ -58,7 +58,8 @@ const runTradingLoop = async () => {
     // Analyze every 60 seconds
     if (now - lastAnalysisTime < 60000) return;
 
-    setImmediate(async () => {
+    // Use setTimeout instead of setImmediate to avoid TS errors
+    setTimeout(async () => {
         try {
             lastAnalysisTime = now;
             addLog('INFO', '正在调用云端战神引擎...');
@@ -133,7 +134,7 @@ const runTradingLoop = async () => {
         } catch (e: any) {
             addLog('ERROR', `策略执行异常: ${e.message}`);
         }
-    });
+    }, 0);
 };
 
 // Start Loop

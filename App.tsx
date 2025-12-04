@@ -1,3 +1,4 @@
+
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { Settings, Play, Pause, RefreshCw, Activity, Zap, TrendingUp, AlertCircle, Terminal, Shield, Target, Brain, X, Eye, Flame, Cloud } from 'lucide-react';
 import { MarketDataCollection, AccountBalance, PositionData, AIDecision, SystemLog, AppConfig } from './types';
@@ -27,18 +28,32 @@ const App: React.FC = () => {
   const fetchStatus = useCallback(async () => {
     try {
         const res = await fetch('/api/status');
-        const data = await res.json();
         
-        setIsRunning(data.isRunning);
-        setMarketData(data.marketData);
-        setAccountData(data.accountData);
-        setLatestDecision(data.latestDecision);
-        setLogs(data.logs); // Sync logs from server
+        // Handle non-200 responses or HTML/text responses
+        if (!res.ok) {
+           // If backend is down or 404, we might get here.
+           // Don't log error to console every second if it's just polling.
+           return; 
+        }
 
-        // Sync local config display if needed, but be careful not to overwrite local editing
-        // Here we just rely on local config state for the modal, push to server on save
+        const text = await res.text();
+        try {
+            const data = JSON.parse(text);
+            setIsRunning(data.isRunning);
+            setMarketData(data.marketData);
+            setAccountData(data.accountData);
+            setLatestDecision(data.latestDecision);
+            setLogs(data.logs); // Sync logs from server
+
+            // Sync local config display if needed, but be careful not to overwrite local editing
+            // Here we just rely on local config state for the modal, push to server on save
+        } catch (parseError) {
+             // This happens if the server returns HTML (e.g. 404 page) or empty string
+             // console.warn("Invalid JSON response:", text.substring(0, 50));
+        }
     } catch (e) {
-        console.error("Connection lost:", e);
+        // Network error (fetch failed)
+        // console.error("Connection lost:", e);
     }
   }, []);
 
@@ -49,22 +64,30 @@ const App: React.FC = () => {
   }, [fetchStatus]);
 
   const toggleRunning = async () => {
-      await fetch('/api/toggle', {
-          method: 'POST',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({ running: !isRunning })
-      });
-      fetchStatus();
+      try {
+        await fetch('/api/toggle', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ running: !isRunning })
+        });
+        fetchStatus();
+      } catch (e) {
+        console.error("Failed to toggle:", e);
+      }
   };
 
   const saveConfig = async (newConfig: AppConfig) => {
-      await fetch('/api/config', {
-          method: 'POST',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify(newConfig)
-      });
-      setConfig(newConfig);
-      setIsSettingsOpen(false);
+      try {
+        await fetch('/api/config', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(newConfig)
+        });
+        setConfig(newConfig);
+        setIsSettingsOpen(false);
+      } catch (e) {
+        console.error("Failed to save config:", e);
+      }
   };
 
   const formatPrice = (p?: string) => parseFloat(p || "0").toLocaleString('en-US', { minimumFractionDigits: 2 });
