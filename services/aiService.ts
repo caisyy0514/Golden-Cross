@@ -137,7 +137,7 @@ const callDeepSeek = async (apiKey: string, messages: any[]) => {
                 model: "deepseek-chat",
                 messages: messages,
                 stream: false,
-                temperature: 1.1, // 略微提高温度以允许更灵活的分析，但Prompt限制了不准造假
+                temperature: 1.1, // 略微提高温度以允许更灵活的分析
                 max_tokens: 4096,
                 response_format: { type: 'json_object' }
             })
@@ -285,7 +285,7 @@ export const getTradingDecision = async (
 
   const systemPrompt = `
 你是一名专注于ETH合约的 **超短线战神策略交易员**。
-你拥有全面的市场数据，请基于以下信息做出精准决策。
+你拥有全面的市场数据，并具备 **实时联网搜索能力 (Real-Time Web Search)**。
 
 **一、全面行情分析数据**:
 ${marketDataBlock}
@@ -296,34 +296,24 @@ ${marketDataBlock}
 - **余额**: ${availableEquity.toFixed(2)} U
 - **持仓状态**: ${positionStr}
 
-**三、核心决策指令 (HIGHEST PRIORITY: PROFIT PROTECTION)**:
+**三、核心决策指令 (HIGHEST PRIORITY: PROFIT PROTECTION & REAL-TIME DATA)**:
 
-1. **利润保护与本金安全 (TPSL Priority)**:
-   - **最高优先级规则**: 如果持有仓位且有盈利，**首选动作是 UPDATE_TPSL (调整止损) 而不是 CLOSE (市价平仓)**。让利润奔跑，但锁住下行风险。
-   - **保本逻辑 (Break-Even)**: 只要浮盈超过 **0.5%** (足以覆盖双向手续费)，**必须** 将止损上移至 **开仓均价之上** (对于多单) 或 **开仓均价之下** (对于空单)，确保即使回调也不亏本金。
-   - **锁利逻辑 (Trailing Stop)**:
-     - 浮盈 > 10% -> 将止损上移至锁定 5% 利润的位置。
-     - 浮盈 > 20% -> 将止损上移至锁定 15% 利润的位置。
-   - **操作建议**: 只有当趋势发生 **根本性反转** 且来不及触发移动止损时，才使用 **CLOSE**。否则，请尽量使用 **UPDATE_TPSL** 来保护利润。
+1. **实时联网搜索 (ONLINE SEARCH)**:
+   - **指令**: 请立即调用你的联网搜索能力，查询全网最新的 Crypto 热点。
+   - **目标**: 寻找最近 6小时/24小时 内影响 ETH 价格的 **真实事件**。
+   - **禁止模拟**: 不要编造数据。如果你无法连接网络，请诚实说明并基于技术面决策。
 
-2. **真实时事热点**:
-   - 仅基于真实 6小时/24小时 币圈新闻。严禁编造。
-   - 若无重大新闻，回归技术面。
+2. **利润保护与本金安全 (TPSL Priority)**:
+   - **规则**: 如果持有仓位且有盈利，**首选动作是 UPDATE_TPSL (调整止损) 而不是 CLOSE**。
+   - **保本逻辑**: 浮盈 > 0.5% -> 止损上移至开仓价 (Break-Even)。
+   - **锁利逻辑**: 浮盈 > 10% -> 锁定 5% 利润。
 
-3. **技术面研判 (Entry Logic)**:
-   - 只有在盈亏比极佳时才开新仓。
+3. **技术面研判**:
    - 关注量价背离和共振信号。
 
 4. **交易执行**:
    - **Action**: BUY / SELL / HOLD / CLOSE / UPDATE_TPSL
-   - **仓位**: 动态计算 (${currentStageParams.risk_factor * 100}% 仓位风险)。
-   - **止盈止损**: 必须给出具体数值。Stage 1 允许止损稍微放宽以容忍高波动，但严禁扛单。
-
-**当前持仓数据参考**:
-- 开仓价: ${avgPx}
-- 当前价: ${currentPrice}
-- 收益率: ${uplRatio.toFixed(2)}%
-- 当前已设止损: ${hasPosition ? (primaryPosition?.slTriggerPx || "无") : "N/A"}
+   - **Stop Loss 必填**: 开新仓必须带止损。
 
 请生成纯净的 JSON 格式交易决策。
 `;
@@ -331,7 +321,7 @@ ${marketDataBlock}
   const responseSchema = `
   {
     "stage_analysis": "...",
-    "hot_events_overview": "...",
+    "hot_events_overview": "【联网搜索结果】...",
     "market_assessment": "...",
     "eth_analysis": "...", 
     "trading_decision": {
@@ -350,7 +340,7 @@ ${marketDataBlock}
   try {
     const text = await callDeepSeek(apiKey, [
         { role: "system", content: systemPrompt + "\nJSON ONLY, NO MARKDOWN:\n" + responseSchema },
-        { role: "user", content: "基于当前持仓和市场数据，给出最优操作指令（优先考虑移动止损保护利润）。" }
+        { role: "user", content: "请调用你的搜索能力获取实时数据，并结合持仓给出最优操作指令。" }
     ]);
 
     if (!text) throw new Error("AI 返回为空");
