@@ -20,9 +20,9 @@ const SettingsModal: React.FC<Props> = ({ isOpen, onClose, config, onSave }) => 
 
   const handleTestConnection = async () => {
     setTestStatus('loading');
-    setTestMsg('正在连接 Google Gemini...');
+    setTestMsg('正在连接 DeepSeek API...');
     try {
-      const res = await testConnection(localConfig.geminiApiKey);
+      const res = await testConnection(localConfig.deepseekApiKey);
       setTestStatus('success');
       setTestMsg(`连接成功! 响应: ${res.substring(0, 20)}...`);
     } catch (e: any) {
@@ -61,20 +61,20 @@ const SettingsModal: React.FC<Props> = ({ isOpen, onClose, config, onSave }) => 
             </label>
           </div>
 
-          {/* Gemini Key */}
+          {/* DeepSeek Key */}
           <div className="space-y-2">
-            <label className="block text-sm font-medium text-okx-subtext">Gemini API Key (用于 DeepSeek 逻辑模拟)</label>
+            <label className="block text-sm font-medium text-okx-subtext">DeepSeek API Key (用于智能决策)</label>
             <div className="flex gap-2">
                 <input 
                 type="password"
                 className="flex-1 bg-okx-bg border border-okx-border rounded px-3 py-2 text-white focus:outline-none focus:border-okx-primary"
-                value={localConfig.geminiApiKey}
-                onChange={e => setLocalConfig({...localConfig, geminiApiKey: e.target.value})}
-                placeholder="AI Studio Key..."
+                value={localConfig.deepseekApiKey}
+                onChange={e => setLocalConfig({...localConfig, deepseekApiKey: e.target.value})}
+                placeholder="sk-..."
                 />
                 <button 
                   onClick={handleTestConnection}
-                  disabled={testStatus === 'loading' || !localConfig.geminiApiKey}
+                  disabled={testStatus === 'loading' || !localConfig.deepseekApiKey}
                   className="px-3 py-2 bg-gray-700 hover:bg-gray-600 rounded text-white disabled:opacity-50"
                   title="测试 API 连接"
                 >
