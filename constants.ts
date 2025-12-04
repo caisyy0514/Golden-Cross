@@ -8,7 +8,7 @@ export const DEFAULT_CONFIG = {
   okxApiKey: "",
   okxSecretKey: "",
   okxPassphrase: "",
-  geminiApiKey: "",
+  deepseekApiKey: "", // Renamed
   isSimulation: true, 
 };
 
