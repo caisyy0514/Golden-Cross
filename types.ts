@@ -1,4 +1,3 @@
-
 // OKX Data Types
 export interface TickerData {
   instId: string;
@@ -33,6 +32,7 @@ export interface PositionData {
   posSide: 'long' | 'short' | 'net';
   pos: string; // Size
   avgPx: string; // Average Price
+  breakEvenPx?: string; // NEW: Exchange provided break-even price
   upl: string; // Unrealized PnL
   uplRatio: string; // PnL Ratio
   mgnMode: string; // 'isolated' or 'cross'
