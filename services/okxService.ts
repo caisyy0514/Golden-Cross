@@ -8,14 +8,6 @@ const randomVariation = (base: number, percent: number) => {
 
 const BASE_URL = "https://www.okx.com";
 
-// Helper: Format Price to 2 decimal places (ETH standard tick size)
-const formatPx = (price: string | number | undefined | null): string | undefined => {
-    if (price === undefined || price === null || price === '') return undefined;
-    const p = parseFloat(price.toString());
-    if (isNaN(p) || p <= 0) return undefined;
-    return p.toFixed(2);
-};
-
 const signRequest = (method: string, requestPath: string, body: string = '', secretKey: string) => {
   const timestamp = new Date().toISOString();
   const message = timestamp + method + requestPath + body;
@@ -45,11 +37,15 @@ export const fetchMarketData = async (config: any): Promise<MarketDataCollection
     const tickerRes = await fetch(`${BASE_URL}/api/v5/market/ticker?instId=${INSTRUMENT_ID}`);
     const tickerJson = await tickerRes.json();
     
-    const candles5mRes = await fetch(`${BASE_URL}/api/v5/market/candles?instId=${INSTRUMENT_ID}&bar=5m&limit=50`);
-    const candles5mJson = await candles5mRes.json();
+    // 1. 获取 1小时 K线 (用于判断主趋势 Trend)
+    // 获取300根以确保 EMA(60) 计算稳定
+    const candles1HRes = await fetch(`${BASE_URL}/api/v5/market/candles?instId=${INSTRUMENT_ID}&bar=1H&limit=300`);
+    const candles1HJson = await candles1HRes.json();
     
-    const candles15mRes = await fetch(`${BASE_URL}/api/v5/market/candles?instId=${INSTRUMENT_ID}&bar=15m&limit=100`);
-    const candles15mJson = await candles15mRes.json();
+    // 2. 获取 3分钟 K线 (用于入场信号 Entry)
+    // 获取300根以确保能回溯到金叉/死叉形态
+    const candles3mRes = await fetch(`${BASE_URL}/api/v5/market/candles?instId=${INSTRUMENT_ID}&bar=3m&limit=300`);
+    const candles3mJson = await candles3mRes.json();
 
     const fundingRes = await fetch(`${BASE_URL}/api/v5/public/funding-rate?instId=${INSTRUMENT_ID}`);
     const fundingJson = await fundingRes.json();
@@ -61,8 +57,8 @@ export const fetchMarketData = async (config: any): Promise<MarketDataCollection
 
     return {
       ticker: tickerJson.data[0],
-      candles5m: formatCandles(candles5mJson.data),
-      candles15m: formatCandles(candles15mJson.data),
+      candles1H: formatCandles(candles1HJson.data),
+      candles3m: formatCandles(candles3mJson.data),
       fundingRate: fundingJson.data[0]?.fundingRate || "0",
       openInterest: oiJson.data[0]?.oi || "0",
       orderbook: {}, 
@@ -120,7 +116,6 @@ export const fetchAccountData = async (config: any): Promise<AccountContext> => 
                 posSide: rawPos.posSide,
                 pos: rawPos.pos,
                 avgPx: rawPos.avgPx,
-                breakEvenPx: rawPos.breakEvenPx, // Map Break Even Price from API
                 upl: rawPos.upl,
                 uplRatio: rawPos.uplRatio,
                 mgnMode: rawPos.mgnMode,
@@ -129,7 +124,6 @@ export const fetchAccountData = async (config: any): Promise<AccountContext> => 
                 cTime: rawPos.cTime
             };
             
-             // Find SL/TP orders specific to this position side
              if (algoOrders.length > 0) {
                  const slOrder = algoOrders.find((o: any) => o.instId === rawPos.instId && o.posSide === rawPos.posSide && o.slTriggerPx && parseFloat(o.slTriggerPx) > 0);
                  const tpOrder = algoOrders.find((o: any) => o.instId === rawPos.instId && o.posSide === rawPos.posSide && o.tpTriggerPx && parseFloat(o.tpTriggerPx) > 0);
@@ -185,13 +179,14 @@ const ensureLongShortMode = async (config: any) => {
     
     if (json.code === '0' && json.data && json.data[0]) {
         if (json.data[0].posMode !== 'long_short_mode') {
+            console.log("Switching to long_short_mode...");
             const setPath = "/api/v5/account/set-position-mode";
             const setBody = JSON.stringify({ posMode: 'long_short_mode' });
             const setHeaders = getHeaders('POST', setPath, setBody, config);
             const setRes = await fetch(BASE_URL + setPath, { method: 'POST', headers: setHeaders, body: setBody });
             const setJson = await setRes.json();
             if (setJson.code !== '0') {
-                throw new Error(`无法切换持仓模式为双向持仓: ${setJson.msg}。请确保无持仓后重试。`);
+                throw new Error(`无法切换持仓模式为双向持仓: ${setJson.msg}`);
             }
         }
     }
@@ -204,50 +199,36 @@ export const executeOrder = async (order: AIDecision, config: any): Promise<any>
   }
   
   try {
-    try {
-        await ensureLongShortMode(config);
-    } catch (e: any) {
-        console.warn("Position Mode Check Failed:", e.message);
-    }
+    try { await ensureLongShortMode(config); } catch (e: any) { console.warn("Pos Mode Warn:", e.message); }
 
     if (order.action === 'CLOSE') {
         const closePath = "/api/v5/trade/close-position";
         
-        const closeLongBody = JSON.stringify({
-            instId: INSTRUMENT_ID,
-            posSide: 'long', 
-            mgnMode: 'isolated'
-        });
+        // 尝试平多
+        const closeLongBody = JSON.stringify({ instId: INSTRUMENT_ID, posSide: 'long', mgnMode: 'isolated' });
         const headersLong = getHeaders('POST', closePath, closeLongBody, config);
         const resLong = await fetch(BASE_URL + closePath, { method: 'POST', headers: headersLong, body: closeLongBody });
         const jsonLong = await resLong.json();
-        
-        if (jsonLong.code === '0') return jsonLong; 
-        
-        const closeShortBody = JSON.stringify({ 
-            instId: INSTRUMENT_ID, 
-            posSide: 'short', 
-            mgnMode: 'isolated' 
-        });
+        if (jsonLong.code === '0') return jsonLong;
+
+        // 尝试平空
+        const closeShortBody = JSON.stringify({ instId: INSTRUMENT_ID, posSide: 'short', mgnMode: 'isolated' });
         const headersShort = getHeaders('POST', closePath, closeShortBody, config);
         const resShort = await fetch(BASE_URL + closePath, { method: 'POST', headers: headersShort, body: closeShortBody });
         const jsonShort = await resShort.json();
-
         if (jsonShort.code === '0') return jsonShort;
 
-        const longMsg = jsonLong.code === '51000' || jsonLong.msg.includes('不存在') ? '多单不存在' : jsonLong.msg;
-        const shortMsg = jsonShort.code === '51000' || jsonShort.msg.includes('不存在') ? '空单不存在' : jsonShort.msg;
-        
-        throw new Error(`平仓失败 (多: ${longMsg}, 空: ${shortMsg})`);
+        throw new Error(`平仓失败 (多: ${jsonLong.msg}, 空: ${jsonShort.msg})`);
     }
 
+    // 买入/卖出逻辑
     const posSide = order.action === 'BUY' ? 'long' : 'short';
     const side = order.action === 'BUY' ? 'buy' : 'sell';
 
     try {
         await setLeverage(INSTRUMENT_ID, order.leverage || "50", posSide, config);
     } catch (e: any) {
-        throw new Error(`无法设置战神策略杠杆: ${e.message}`);
+        throw new Error(`无法设置杠杆: ${e.message}`);
     }
 
     const path = "/api/v5/trade/order";
@@ -269,34 +250,26 @@ export const executeOrder = async (order: AIDecision, config: any): Promise<any>
         sz: sizeStr
     };
     
-    const validTp = formatPx(order.trading_decision?.profit_target);
-    const validSl = formatPx(order.trading_decision?.stop_loss);
+    // 附带止损 (注意：根据OKX规则，市价单附带止损止盈参数可能不同，这里使用attachAlgoOrds)
+    const slPrice = order.trading_decision?.stop_loss;
+    const cleanPrice = (p: string | undefined) => p && !isNaN(parseFloat(p)) && parseFloat(p) > 0 ? p : null;
+    const validSl = cleanPrice(slPrice);
 
-    if (validTp || validSl) {
-        const algoOrder: any = {};
-        if (validTp) {
-            algoOrder.tpTriggerPx = validTp;
-            algoOrder.tpOrdPx = '-1'; 
-        }
-        if (validSl) {
-            algoOrder.slTriggerPx = validSl;
-            algoOrder.slOrdPx = '-1'; 
-        }
-        bodyObj.attachAlgoOrds = [algoOrder];
+    if (validSl) {
+        bodyObj.attachAlgoOrds = [{
+            slTriggerPx: validSl,
+            slOrdPx: '-1' // 市价止损
+        }];
     }
     
     const requestBody = JSON.stringify(bodyObj);
     const headers = getHeaders('POST', path, requestBody, config);
+    
     const response = await fetch(BASE_URL + path, { method: 'POST', headers: headers, body: requestBody });
     const json = await response.json();
 
     if (json.code !== '0') {
-        let errorMsg = `Code ${json.code}: ${json.msg}`;
-        if (json.data) errorMsg += ` (Data: ${JSON.stringify(json.data)})`;
-        if (json.code === '51008') {
-            errorMsg = "余额不足 (51008): 账户资金无法支付当前开仓保证金及手续费，系统将尝试降低仓位重试。";
-        }
-        throw new Error(errorMsg);
+        throw new Error(`下单失败: ${json.msg} (Code: ${json.code})`);
     }
     return json;
 
@@ -308,116 +281,60 @@ export const executeOrder = async (order: AIDecision, config: any): Promise<any>
 
 export const updatePositionTPSL = async (instId: string, posSide: 'long' | 'short', size: string, slPrice?: string, tpPrice?: string, config?: any) => {
     if (config.isSimulation) {
-        console.log(`[SIM] Updated TP/SL for ${posSide}: SL=${slPrice}, TP=${tpPrice}, Size=${size}`);
+        console.log(`[SIM] Updated TP/SL: SL=${slPrice}, TP=${tpPrice}`);
         return { code: "0", msg: "模拟更新成功" };
     }
 
     try {
-        const finalSl = formatPx(slPrice);
-        const finalTp = formatPx(tpPrice);
-
-        if (!finalSl && !finalTp) return { code: "0", msg: "无新的止盈止损价格，跳过更新" };
-
         const pendingAlgos = await fetchAlgoOrders(config);
-        
-        // ----------------------------------------
-        // Step 1: Place NEW Algo Orders First
-        // ----------------------------------------
-        const path = "/api/v5/trade/order-algo";
-        let slSuccess = false;
-        let tpSuccess = false;
+        const toCancel = pendingAlgos
+            .filter((o: any) => o.instId === instId && o.posSide === posSide)
+            .map((o: any) => ({ algoId: o.algoId, instId }));
 
-        if (finalSl) {
-            const slBody = JSON.stringify({
-                instId,
-                posSide,
-                tdMode: 'isolated',
-                side: posSide === 'long' ? 'sell' : 'buy',
-                ordType: 'conditional',
-                sz: size, 
-                reduceOnly: true,
-                slTriggerPx: finalSl,
-                slOrdPx: '-1'
-            });
-            const slHeaders = getHeaders('POST', path, slBody, config);
-            const slRes = await fetch(BASE_URL + path, { method: 'POST', headers: slHeaders, body: slBody });
-            const slJson = await slRes.json();
-            
-            if (slJson.code === '0') {
-                slSuccess = true;
-                console.log(`[TPSL] New SL placed at ${finalSl}`);
-            } else {
-                throw new Error(`设置新止损失败 (取消操作): ${slJson.msg}`);
-            }
-        }
-
-        if (finalTp) {
-             const tpBody = JSON.stringify({
-                instId,
-                posSide,
-                tdMode: 'isolated',
-                side: posSide === 'long' ? 'sell' : 'buy',
-                ordType: 'conditional',
-                sz: size,
-                reduceOnly: true,
-                tpTriggerPx: finalTp,
-                tpOrdPx: '-1'
-            });
-            const tpHeaders = getHeaders('POST', path, tpBody, config);
-            const tpRes = await fetch(BASE_URL + path, { method: 'POST', headers: tpHeaders, body: tpBody });
-            const tpJson = await tpRes.json();
-
-            if (tpJson.code === '0') {
-                tpSuccess = true;
-                console.log(`[TPSL] New TP placed at ${finalTp}`);
-            } else {
-                throw new Error(`设置新止盈失败: ${tpJson.msg}`);
-            }
-        }
-
-        // ----------------------------------------
-        // Step 2: Cancel OLD Algo Orders Only After Success
-        // ----------------------------------------
-        const ordersToCancel: any[] = [];
-        
-        const isSL = (o: any) => o.slTriggerPx && parseFloat(o.slTriggerPx) > 0;
-        const isTP = (o: any) => o.tpTriggerPx && parseFloat(o.tpTriggerPx) > 0;
-
-        // If we successfully placed a new SL, cancel ALL old SLs for this position
-        if (slSuccess || (finalSl && slSuccess)) { 
-            const oldSls = pendingAlgos.filter((o: any) => o.instId === instId && o.posSide === posSide && isSL(o));
-            ordersToCancel.push(...oldSls.map(o => ({ algoId: o.algoId, instId })));
-        }
-
-        // If we successfully placed a new TP, cancel ALL old TPs for this position
-        if (tpSuccess || (finalTp && tpSuccess)) {
-            const oldTps = pendingAlgos.filter((o: any) => o.instId === instId && o.posSide === posSide && isTP(o));
-            ordersToCancel.push(...oldTps.map(o => ({ algoId: o.algoId, instId })));
-        }
-
-        if (ordersToCancel.length > 0) {
+        if (toCancel.length > 0) {
             const cancelPath = "/api/v5/trade/cancel-algos";
-            const uniqueCancel = Array.from(new Set(ordersToCancel.map(a => a.algoId)))
-                .map(id => ordersToCancel.find(a => a.algoId === id));
-                
-            const cancelBody = JSON.stringify(uniqueCancel);
+            const cancelBody = JSON.stringify(toCancel);
             const headers = getHeaders('POST', cancelPath, cancelBody, config);
             await fetch(BASE_URL + cancelPath, { method: 'POST', headers: headers, body: cancelBody });
-            console.log(`[TPSL] Cleaned up ${uniqueCancel.length} old algo orders.`);
         }
 
-        return { code: "0", msg: "止盈止损安全更新成功" };
+        if (!slPrice && !tpPrice) return { code: "0", msg: "无新的止盈止损" };
+
+        const path = "/api/v5/trade/order-algo";
+        const bodyObj: any = {
+            instId,
+            posSide,
+            tdMode: 'isolated',
+            side: posSide === 'long' ? 'sell' : 'buy',
+            ordType: 'conditional',
+            sz: size, 
+            reduceOnly: true
+        };
+
+        if (slPrice) {
+            bodyObj.slTriggerPx = slPrice;
+            bodyObj.slOrdPx = '-1';
+        }
+        if (tpPrice) {
+            bodyObj.tpTriggerPx = tpPrice;
+            bodyObj.tpOrdPx = '-1';
+        }
+
+        const body = JSON.stringify(bodyObj);
+        const headers = getHeaders('POST', path, body, config);
+        const res = await fetch(BASE_URL + path, { method: 'POST', headers: headers, body: body });
+        const json = await res.json();
+        
+        if (json.code !== '0') throw new Error(`更新TPSL失败: ${json.msg}`);
+        return { code: "0", msg: "止盈止损更新成功" };
 
     } catch (e: any) {
-        console.error("Update TPSL Failed:", e);
-        throw new Error(`更新止盈止损失败: ${e.message}`);
+        throw new Error(`更新失败: ${e.message}`);
     }
 };
 
 export const addMargin = async (params: { instId: string; posSide: string; type: string; amt: string }, config: any) => {
-   if (config.isSimulation) {
-    return { code: "0", msg: "模拟追加保证金成功" };
-  }
+   if (config.isSimulation) return { code: "0", msg: "模拟追加成功" };
   try {
       const path = "/api/v5/account/position/margin-balance";
       const body = JSON.stringify(params);
@@ -433,6 +350,7 @@ export const addMargin = async (params: { instId: string; posSide: string; type:
 
 function formatCandles(apiCandles: any[]): CandleData[] {
   if (!apiCandles || !Array.isArray(apiCandles)) return [];
+  // API returns Newest -> Oldest. We reverse it to Oldest -> Newest for technical analysis calculation
   return apiCandles.map((c: string[]) => ({
     ts: c[0],
     o: c[1],
@@ -446,11 +364,11 @@ function formatCandles(apiCandles: any[]): CandleData[] {
 function generateMockMarketData(): MarketDataCollection {
   const now = Date.now();
   const currentPrice = 3250 + Math.sin(now / 10000) * 50; 
-  const generateCandles = (count: number) => {
+  const generateCandles = (count: number, intervalMs: number) => {
     const candles: CandleData[] = [];
     let price = currentPrice;
     for (let i = 0; i < count; i++) {
-      const ts = (now - i * 900000).toString();
+      const ts = (now - i * intervalMs).toString();
       const open = price;
       const close = randomVariation(open, 0.5);
       candles.push({ 
@@ -468,8 +386,8 @@ function generateMockMarketData(): MarketDataCollection {
 
   return {
     ticker: { ...MOCK_TICKER, last: currentPrice.toFixed(2), ts: now.toString() },
-    candles5m: generateCandles(50),
-    candles15m: generateCandles(100),
+    candles1H: generateCandles(300, 3600000), 
+    candles3m: generateCandles(300, 180000), 
     fundingRate: "0.0001",
     openInterest: "50000",
     orderbook: [],
@@ -480,8 +398,8 @@ function generateMockMarketData(): MarketDataCollection {
 function generateMockAccountData(): AccountContext {
   return {
     balance: {
-      totalEq: "15.00", 
-      availEq: "15.00",
+      totalEq: "1000.00", 
+      availEq: "1000.00",
       uTime: Date.now().toString(),
     },
     positions: []
