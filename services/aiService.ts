@@ -281,14 +281,16 @@ export const getTradingDecision = async (
 
       const buffer = currentPrice * 0.002;
 
-      // 3. 利润/亏损阶段判断
+      // 3. 利润/亏损阶段判断 (Risk & Profit Stages)
       if (netPnL <= 0) {
-          // --- 亏损风控逻辑 ---
+          // --- 亏损风控逻辑 (Loss Risk Control) ---
           const isTrendAligned = isLong 
               ? (currentPrice > ema20 && macdData.hist > -5) 
               : (currentPrice < ema20 && macdData.hist < 5);
           
+          // DCA 补仓判断
           const canDCA = currentStageParams.allow_dca;
+          // 当前持仓名义价值 / 总权益
           const currentPosRatio = positionValue / totalEquity;
           const maxPosRatio = (currentStageParams as any).max_pos_ratio || 2.0;
           const hasSpaceForDCA = currentPosRatio < maxPosRatio;
@@ -404,12 +406,13 @@ ${marketDataBlock}
 **三、核心决策指令 (HIGHEST PRIORITY: RISK, DCA & PROFIT)**:
 
 1. **首次开仓风控 (Initial Entry Rules)**:
-   - **最小名义价值**: 首次开仓名义价值 **必须 >= 50 USDT**。
+   - **最小市值门槛**: 首次开仓的 **实际持仓市值 (Notional Value)** 必须 >= 50 USDT。
+     - 注意：Notional Value = 保证金 × 杠杆。不是指保证金要 50U。
    - **最大止损**: 首次开仓止损造成的亏损，**绝不允许超过保证金 20%**。确保 "Abs(Entry - SL) / Entry * Leverage < 0.2"。
 
 2. **亏损补仓机制 (Strategic DCA - 仅在 A1 阶段)**:
-   - **条件**: 如果【风控与操作建议】提示 "建议补仓"。
-   - **规则**: 补仓时 **不设最小金额限制**，按需补仓。
+   - **条件**: 如果【风控与操作建议】中明确提示 "建议补仓 (DCA)"。
+   - **规则**: 补仓时 **不设最小金额限制**，按需补仓（例如补 0.5 倍仓位），以灵活摊低成本为准。
    - **执行**: Action: BUY/SELL。
 
 3. **趋势破坏风控 (Stop Loss - A2/A3 阶段)**:
@@ -484,11 +487,11 @@ ${marketDataBlock}
     let positionValue = finalMargin * safeLeverage;
 
     // --- NEW LOGIC START ---
-    // 首次开仓限制 50U，加仓不限
+    // 首次开仓限制 50U 市值 (Notional Value)，加仓不限
     const isInitialOpen = !hasPosition;
     const MIN_OPEN_VALUE = isInitialOpen ? 50 : 0; 
 
-    // Auto-correction for Initial Open
+    // Auto-correction for Initial Open (Ensure Notional >= 50U)
     if (isInitialOpen && positionValue < MIN_OPEN_VALUE && availableEquity * 0.9 * safeLeverage > MIN_OPEN_VALUE) {
         if (confidence >= 40) {
              finalMargin = MIN_OPEN_VALUE / safeLeverage;
@@ -505,7 +508,7 @@ ${marketDataBlock}
              console.warn(`[AI] 首次开仓价值过小 (${positionValue.toFixed(2)} U < 50 U)，转为 HOLD`);
              decision.action = 'HOLD';
              decision.size = "0";
-             decision.reasoning += ` [系统修正: 首次开仓金额不足 50 U]`;
+             decision.reasoning += ` [系统修正: 首次开仓市值不足 50 U]`;
         } else {
             // Sizing Logic
             let rawSize = parseFloat(decision.trading_decision.position_size || "0");
