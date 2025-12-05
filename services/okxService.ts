@@ -120,6 +120,7 @@ export const fetchAccountData = async (config: any): Promise<AccountContext> => 
                 posSide: rawPos.posSide,
                 pos: rawPos.pos,
                 avgPx: rawPos.avgPx,
+                breakEvenPx: rawPos.breakEvenPx, // Map Break Even Price from API
                 upl: rawPos.upl,
                 uplRatio: rawPos.uplRatio,
                 mgnMode: rawPos.mgnMode,
@@ -212,7 +213,6 @@ export const executeOrder = async (order: AIDecision, config: any): Promise<any>
     if (order.action === 'CLOSE') {
         const closePath = "/api/v5/trade/close-position";
         
-        // Try Closing LONG
         const closeLongBody = JSON.stringify({
             instId: INSTRUMENT_ID,
             posSide: 'long', 
@@ -224,7 +224,6 @@ export const executeOrder = async (order: AIDecision, config: any): Promise<any>
         
         if (jsonLong.code === '0') return jsonLong; 
         
-        // Try Closing SHORT
         const closeShortBody = JSON.stringify({ 
             instId: INSTRUMENT_ID, 
             posSide: 'short', 
@@ -313,12 +312,6 @@ export const updatePositionTPSL = async (instId: string, posSide: 'long' | 'shor
         return { code: "0", msg: "模拟更新成功" };
     }
 
-    // 安全更新策略：
-    // 1. 获取当前待单
-    // 2. 尝试提交新的 TP/SL 单 (先加)
-    // 3. 如果成功，再撤销旧的 TP/SL 单 (后删)
-    // 这样避免了"先删后加"中间出现错误导致仓位无保护的情况。
-
     try {
         const finalSl = formatPx(slPrice);
         const finalTp = formatPx(tpPrice);
@@ -378,8 +371,6 @@ export const updatePositionTPSL = async (instId: string, posSide: 'long' | 'shor
                 tpSuccess = true;
                 console.log(`[TPSL] New TP placed at ${finalTp}`);
             } else {
-                // 注意：如果 SL 成功但 TP 失败，SL 已经挂上去了，这是可以接受的（至少有保护），但为了严谨这里抛出错误。
-                // 实际操作中，最好分步提示。
                 throw new Error(`设置新止盈失败: ${tpJson.msg}`);
             }
         }
@@ -393,7 +384,7 @@ export const updatePositionTPSL = async (instId: string, posSide: 'long' | 'shor
         const isTP = (o: any) => o.tpTriggerPx && parseFloat(o.tpTriggerPx) > 0;
 
         // If we successfully placed a new SL, cancel ALL old SLs for this position
-        if (slSuccess || (finalSl && slSuccess)) { // Redundant check for clarity
+        if (slSuccess || (finalSl && slSuccess)) { 
             const oldSls = pendingAlgos.filter((o: any) => o.instId === instId && o.posSide === posSide && isSL(o));
             ordersToCancel.push(...oldSls.map(o => ({ algoId: o.algoId, instId })));
         }
@@ -406,7 +397,6 @@ export const updatePositionTPSL = async (instId: string, posSide: 'long' | 'shor
 
         if (ordersToCancel.length > 0) {
             const cancelPath = "/api/v5/trade/cancel-algos";
-            // Deduplicate ids just in case
             const uniqueCancel = Array.from(new Set(ordersToCancel.map(a => a.algoId)))
                 .map(id => ordersToCancel.find(a => a.algoId === id));
                 
