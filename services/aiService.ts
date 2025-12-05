@@ -137,7 +137,7 @@ const callDeepSeek = async (apiKey: string, messages: any[]) => {
                 model: "deepseek-chat",
                 messages: messages,
                 stream: false,
-                temperature: 1.0, // 降低一点温度，使逻辑更严谨
+                temperature: 1.0, 
                 max_tokens: 4096,
                 response_format: { type: 'json_object' }
             })
@@ -249,33 +249,70 @@ export const getTradingDecision = async (
   let positionStr = "当前无持仓 (Empty)";
   let avgPx = 0;
   let uplRatio = 0;
-  let upl = 0;
   
   // Dynamic SL Levels Calculation
-  let breakEvenPrice = 0;
-  let lockProfitPrice_Level1 = 0; // Lock small profit
-  let lockProfitPrice_Level2 = 0; // Lock big profit
+  let safeBreakEvenPrice = 0;
+  let recommendedSL = 0;
+  let profitLockStage = "A: 观察/浮亏期";
   
   if (hasPosition) {
       const p = primaryPosition!;
       avgPx = parseFloat(p.avgPx);
-      upl = parseFloat(p.upl);
       uplRatio = parseFloat(p.uplRatio) * 100;
-      
       const isLong = p.posSide === 'long';
-      // Fee estimation ~0.15% round trip
-      const feeBuffer = avgPx * 0.0015; 
+      
+      // 1. 获取保本价 (优先使用交易所字段，否则估算)
+      let rawBreakEven = p.breakEvenPx ? parseFloat(p.breakEvenPx) : 0;
+      if (rawBreakEven === 0) {
+          // Fallback calc: Entry +/- 0.15% fee
+          rawBreakEven = isLong ? avgPx * 1.0015 : avgPx * 0.9985;
+      }
+      safeBreakEvenPrice = rawBreakEven;
 
-      if (isLong) {
-          breakEvenPrice = avgPx + feeBuffer; // Price must go UP to break even
-          // If price moves up 2%, lock 1% profit
-          lockProfitPrice_Level1 = avgPx + (currentPrice - avgPx) * 0.5; 
-          // If price moves up 5%, lock 3.5% profit
-          lockProfitPrice_Level2 = currentPrice - (avgPx * 0.015); // Trail closely
+      // 2. 计算当前逻辑止损价 (Logic: Buffer Check)
+      // 防止止损设置在现价太近的地方导致 "Parameter Error" 或立即触发
+      // 设定最小安全距离为 0.2%
+      const buffer = currentPrice * 0.002;
+
+      // 3. 判断利润阶段
+      // Stage A: ROI < 0.6% -> Hold (Ignore)
+      // Stage B: 0.6% <= ROI < 2% -> BreakEven
+      // Stage C: 2% <= ROI < 5% -> Lock 50%
+      // Stage D: ROI >= 5% -> Lock 80%
+
+      if (uplRatio < 0.6) {
+          profitLockStage = "A: 浮亏或微利 (保持原止损)";
+      } else if (uplRatio >= 0.6 && uplRatio < 2.0) {
+          profitLockStage = "B: 保本防御 (Break-Even)";
+          recommendedSL = safeBreakEvenPrice;
+      } else if (uplRatio >= 2.0 && uplRatio < 5.0) {
+          profitLockStage = "C: 锁定小利 (Lock 50%)";
+          const profitDiff = Math.abs(currentPrice - avgPx);
+          recommendedSL = isLong 
+              ? avgPx + (profitDiff * 0.5) 
+              : avgPx - (profitDiff * 0.5);
       } else {
-          breakEvenPrice = avgPx - feeBuffer; // Price must go DOWN to break even
-          lockProfitPrice_Level1 = avgPx - (avgPx - currentPrice) * 0.5;
-          lockProfitPrice_Level2 = currentPrice + (avgPx * 0.015);
+          profitLockStage = "D: 趋势收割 (Lock 80%)";
+          const profitDiff = Math.abs(currentPrice - avgPx);
+          recommendedSL = isLong 
+              ? avgPx + (profitDiff * 0.8) 
+              : avgPx - (profitDiff * 0.8);
+      }
+
+      // 安全性修正：如果推荐的止损价太接近现价，强制拉开距离
+      if (recommendedSL > 0) {
+          if (isLong) {
+               if (recommendedSL > currentPrice - buffer) recommendedSL = currentPrice - buffer;
+               // 确保不低于保本价 (除非保本价本身就危险)
+               if (recommendedSL < safeBreakEvenPrice && currentPrice > safeBreakEvenPrice + buffer) {
+                   recommendedSL = safeBreakEvenPrice;
+               }
+          } else { // Short
+               if (recommendedSL < currentPrice + buffer) recommendedSL = currentPrice + buffer;
+               if (recommendedSL > safeBreakEvenPrice && currentPrice < safeBreakEvenPrice - buffer) {
+                   recommendedSL = safeBreakEvenPrice;
+               }
+          }
       }
 
       positionStr = `
@@ -285,12 +322,11 @@ export const getTradingDecision = async (
       收益率: ${uplRatio.toFixed(2)}% (未结: ${p.upl} U)
       ----------------------------------------
       【系统计算参考值】
-      1. 预估保本价 (Break-Even): ${breakEvenPrice.toFixed(2)}
-      2. 推荐锁利价 (若收益>2%): ${lockProfitPrice_Level1.toFixed(2)}
-      3. 推荐锁利价 (若收益>5%): ${lockProfitPrice_Level2.toFixed(2)}
+      * 交易所保本价: ${safeBreakEvenPrice.toFixed(2)}
+      * 当前利润阶段: ${profitLockStage}
+      * 推荐止损价 (已含安全缓冲): ${recommendedSL > 0 ? recommendedSL.toFixed(2) : "无 (保持原样)"}
       ----------------------------------------
       当前生效止损 (SL): ${p.slTriggerPx || "⚠️未设置"}
-      当前生效止盈 (TP): ${p.tpTriggerPx || "⚠️未设置"}
       `;
   }
 
@@ -329,40 +365,25 @@ ${marketDataBlock}
 - **余额**: ${availableEquity.toFixed(2)} U
 - **持仓状态**: ${positionStr}
 
-**三、核心决策指令 (HIGHEST PRIORITY: PROFIT LADDER PROTECTION)**:
+**三、核心决策指令 (HIGHEST PRIORITY: LADDER PROTECTION)**:
 
-1. **阶梯式止盈与浮亏容忍 (Ladder Trailing Stop Logic)**:
-   请严格根据当前的 **收益率 (ROI)** 决定止损调整策略：
-
-   *   **阶段 A: 浮亏或微利期 (ROI < 0.6%)**: 
-       - **策略**: **容忍波动**。不要急于将止损移至保本价，以免被正常震荡扫出。
-       - **动作**: 保持初始止损 (HOLD)，除非技术形态完全破位。
-
-   *   **阶段 B: 保本期 (0.6% <= ROI < 2%)**:
-       - **策略**: **本金安全第一**。利润已覆盖手续费。
-       - **动作**: 立即执行 **UPDATE_TPSL**，将止损上移至 **预估保本价** (Break-Even) 附近。
-
-   *   **阶段 C: 利润增长期 (2% <= ROI < 5%)**:
-       - **策略**: **锁定部分利润**。
-       - **动作**: 执行 **UPDATE_TPSL**，将止损上移至 **推荐锁利价 Level 1** (锁定约 50% 的浮盈)。
-
-   *   **阶段 D: 利润收割期 (ROI >= 5%)**:
-       - **策略**: **紧跟趋势 (Tight Trail)**。防止大幅回撤。
-       - **动作**: 执行 **UPDATE_TPSL**，将止损上移至 **推荐锁利价 Level 2** (锁定约 80% 的浮盈)。
-
-   *   **注意**: 止损价格只能 **更有利于盈利** 的方向移动 (单向棘轮)，严禁回调止损线（严禁扛单）。
+1. **利润保护执行 (Strict Execution)**:
+   - 请直接参考【系统计算参考值】中的 **当前利润阶段** 和 **推荐止损价**。
+   - **规则**: 
+     - 如果当前处于 "Stage A" (浮亏或微利)，**不要移动止损**，除非原止损位已被技术破坏。允许浮亏震荡。
+     - 如果处于 "Stage B, C, D"，且 **推荐止损价** 与 **当前生效止损 (SL)** 不同（或者当前未设置 SL），请立即发出 **UPDATE_TPSL** 指令，将 stop_loss 设置为 **推荐止损价**。
+   - **目的**: 这里的推荐价已经考虑了交易所保本价和安全挂单距离，请信任该数值，防止挂单失败。
 
 2. **实时联网搜索 (ONLINE SEARCH)**:
    - **指令**: 立即搜索全网 Crypto 热点 (6h/24h)。
    - **禁止模拟**: 必须基于真实数据。
 
-3. **技术面研判**:
-   - 关注量价背离和共振信号。
-
-4. **交易执行**:
+3. **交易执行**:
    - **Action**: BUY / SELL / HOLD / CLOSE / UPDATE_TPSL
-   - **Update TPSL**: 保护利润时使用。
-   - **Stop Loss 必填**: 开新仓必须带止损。
+   - **Update TPSL**: 仅在需要调整止损以锁定利润或保本时使用。
+   - **Stop Loss**: 
+      - 如果是 UPDATE_TPSL，填入具体的数值。
+      - 如果是 BUY/SELL，必须填入初始止损（建议开仓价 +/- 1% 或关键技术位）。
 
 请生成纯净的 JSON 格式交易决策。
 `;
@@ -379,7 +400,7 @@ ${marketDataBlock}
       "position_size": "动态计算",
       "leverage": "${currentStageParams.leverage}",
       "profit_target": "价格 (TP, 2位小数)",
-      "stop_loss": "价格 (SL, 2位小数 - 重点关注此字段，执行阶梯止盈)",
+      "stop_loss": "价格 (SL, 2位小数 - 请优先使用推荐止损价)",
       "invalidation_condition": "..."
     },
     "reasoning": "..."
@@ -389,7 +410,7 @@ ${marketDataBlock}
   try {
     const text = await callDeepSeek(apiKey, [
         { role: "system", content: systemPrompt + "\nJSON ONLY, NO MARKDOWN:\n" + responseSchema },
-        { role: "user", content: "请调用你的搜索能力获取实时数据，并根据【阶梯式止盈逻辑】检查是否需要调整止损。" }
+        { role: "user", content: "请调用你的搜索能力获取实时数据，并根据【系统计算参考值】检查是否需要调整止损。" }
     ]);
 
     if (!text) throw new Error("AI 返回为空");
