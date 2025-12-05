@@ -1,612 +1,286 @@
 import { AIDecision, MarketDataCollection, AccountContext, CandleData } from "../types";
-import { CONTRACT_VAL_ETH, STRATEGY_STAGES, INSTRUMENT_ID } from "../constants";
+import { CONTRACT_VAL_ETH, INSTRUMENT_ID } from "../constants";
 
-// --- Technical Indicator Helpers ---
+// --- Technical Analysis Helpers ---
 
-// Simple Moving Average
-const calcSMA = (data: number[], period: number): number => {
-  if (data.length < period) return 0;
-  const slice = data.slice(data.length - period);
-  const sum = slice.reduce((a, b) => a + b, 0);
-  return sum / period;
-};
-
-// Standard Deviation
-const calcStdDev = (data: number[], period: number): number => {
-  if (data.length < period) return 0;
-  const sma = calcSMA(data, period);
-  const slice = data.slice(data.length - period);
-  const squaredDiffs = slice.map(x => Math.pow(x - sma, 2));
-  const avgSquaredDiff = squaredDiffs.reduce((a, b) => a + b, 0) / period;
-  return Math.sqrt(avgSquaredDiff);
-};
-
-// RSI
-const calcRSI = (prices: number[], period: number = 14): number => {
-  if (prices.length < period + 1) return 50;
-  let gains = 0, losses = 0;
-  // Calculate initial average
-  for (let i = 1; i <= period; i++) {
-    const change = prices[i] - prices[i - 1];
-    if (change > 0) gains += change;
-    else losses -= change;
-  }
-  let avgGain = gains / period;
-  let avgLoss = losses / period;
-
-  // Smoothing
-  for (let i = period + 1; i < prices.length; i++) {
-      const change = prices[i] - prices[i - 1];
-      const gain = change > 0 ? change : 0;
-      const loss = change < 0 ? -change : 0;
-      avgGain = (avgGain * (period - 1) + gain) / period;
-      avgLoss = (avgLoss * (period - 1) + loss) / period;
-  }
-  
-  if (avgLoss === 0) return 100;
-  const rs = avgGain / avgLoss;
-  return 100 - (100 / (1 + rs));
-};
-
-// EMA
-const calcEMA = (prices: number[], period: number): number => {
-  if (prices.length < period) return prices[prices.length - 1];
+const calcEMA = (prices: number[], period: number): number[] => {
   const k = 2 / (period + 1);
-  let ema = prices[0];
+  const emaArray: number[] = [];
+  if (prices.length === 0) return [];
+
+  // Seed with simple price to avoid wait (or use SMA)
+  let prevEma = prices[0];
+  emaArray.push(prevEma);
+
   for (let i = 1; i < prices.length; i++) {
-    ema = prices[i] * k + ema * (1 - k);
+    const val = prices[i] * k + prevEma * (1 - k);
+    emaArray.push(val);
+    prevEma = val;
   }
-  return ema;
+  return emaArray;
 };
 
-// MACD
-const calcMACD = (prices: number[]) => {
-  const shortPeriod = 12;
-  const longPeriod = 26;
-  const signalPeriod = 9;
-  
-  if (prices.length < longPeriod) return { macd: 0, signal: 0, hist: 0 };
-  
-  // Calculate EMA12 and EMA26 arrays to get MACD line array
-  // Simplified: Just calculating the *latest* values for prompt
-  const ema12 = calcEMA(prices.slice(-shortPeriod * 2), shortPeriod); 
-  const ema26 = calcEMA(prices.slice(-longPeriod * 2), longPeriod);
-  
-  const macdLine = ema12 - ema26;
-  const signalLine = macdLine * 0.8; 
-  
-  return { macd: macdLine, signal: signalLine, hist: macdLine - signalLine };
-};
+// --- Strategy Core ---
 
-// Bollinger Bands
-const calcBollinger = (prices: number[], period: number = 20, multiplier: number = 2) => {
-    const mid = calcSMA(prices, period);
-    const std = calcStdDev(prices, period);
-    return {
-        upper: mid + multiplier * std,
-        mid: mid,
-        lower: mid - multiplier * std
-    };
-};
+interface CrossEvent {
+    index: number;
+    type: 'GOLDEN' | 'DEAD'; // GOLDEN: 15 > 60, DEAD: 15 < 60
+    price: number;
+    ts: string;
+}
 
-// KDJ
-const calcKDJ = (highs: number[], lows: number[], closes: number[], period: number = 9) => {
-    let k = 50, d = 50, j = 50;
+/**
+ * 核心策略逻辑:
+ * 1. 趋势判断 (1H): EMA(15) > EMA(60) 为上涨, 反之为下跌
+ * 2. 入场信号 (3m): 
+ *    - 做多: 1H上涨 + 3m出现 "死叉 -> 金叉" 序列
+ *    - 做空: 1H下跌 + 3m出现 "金叉 -> 死叉" 序列
+ */
+const analyzeStrategy = (marketData: MarketDataCollection, accountData: AccountContext) => {
+    // 1. 数据准备
+    const c1h = marketData.candles1H; // Oldest -> Newest
+    const c3m = marketData.candles3m; // Oldest -> Newest
     
-    // We iterate through the data to smooth K and D
-    // Starting from index 'period'
-    for (let i = 0; i < closes.length; i++) {
-        if (i < period - 1) continue;
-        
-        // Find Highest High and Lowest Low in last 9 periods
-        let localLow = lows[i];
-        let localHigh = highs[i];
-        for (let x = 0; x < period; x++) {
-             if (lows[i-x] < localLow) localLow = lows[i-x];
-             if (highs[i-x] > localHigh) localHigh = highs[i-x];
+    if (c1h.length < 60 || c3m.length < 60) {
+        return { action: 'HOLD', reason: "数据不足，正在积累K线...", sl: 0, isUpTrend: false };
+    }
+
+    // 2. 趋势判定 (1H Chart)
+    const closes1h = c1h.map(c => parseFloat(c.c));
+    const ema15_1h = calcEMA(closes1h, 15);
+    const ema60_1h = calcEMA(closes1h, 60);
+    
+    // 取最后一根已收盘K线的状态 (倒数第二根，防止当前K线跳动导致信号闪烁)
+    // 或者取最新状态，这里取最新
+    const idx1h = closes1h.length - 1;
+    const isUpTrend = ema15_1h[idx1h] > ema60_1h[idx1h];
+    const trendDesc = isUpTrend ? "📈 1H 上涨趋势 (EMA15 > EMA60)" : "📉 1H 下跌趋势 (EMA15 < EMA60)";
+
+    // 3. 入场信号扫描 (3m Chart)
+    const closes3m = c3m.map(c => parseFloat(c.c));
+    const highs3m = c3m.map(c => parseFloat(c.h));
+    const lows3m = c3m.map(c => parseFloat(c.l));
+    
+    const ema15_3m = calcEMA(closes3m, 15);
+    const ema60_3m = calcEMA(closes3m, 60);
+
+    // 寻找最近的交叉点
+    const crosses: CrossEvent[] = [];
+    // 只扫描最近 50 根K线，提高效率
+    const scanStart = Math.max(1, c3m.length - 50);
+    
+    for(let i = scanStart; i < c3m.length; i++) {
+        const prev15 = ema15_3m[i-1];
+        const prev60 = ema60_3m[i-1];
+        const curr15 = ema15_3m[i];
+        const curr60 = ema60_3m[i];
+
+        if (prev15 <= prev60 && curr15 > curr60) {
+            crosses.push({ index: i, type: 'GOLDEN', price: closes3m[i], ts: c3m[i].ts });
+        } else if (prev15 >= prev60 && curr15 < curr60) {
+            crosses.push({ index: i, type: 'DEAD', price: closes3m[i], ts: c3m[i].ts });
         }
-        
-        const rsv = (localHigh === localLow) ? 50 : ((closes[i] - localLow) / (localHigh - localLow)) * 100;
-        
-        k = (2/3) * k + (1/3) * rsv;
-        d = (2/3) * d + (1/3) * k;
-        j = 3 * k - 2 * d;
-    }
-    return { k, d, j };
-};
-
-// --- DeepSeek API Helper ---
-const DEEPSEEK_API_URL = "https://api.deepseek.com/chat/completions";
-
-const callDeepSeek = async (apiKey: string, messages: any[]) => {
-    const cleanKey = apiKey ? apiKey.trim() : "";
-    if (!cleanKey) throw new Error("API Key 为空");
-    // eslint-disable-next-line no-control-regex
-    if (/[^\x00-\x7F]/.test(cleanKey)) {
-        throw new Error("API Key 包含非法字符(中文或特殊符号)");
     }
 
-    try {
-        const response = await fetch(DEEPSEEK_API_URL, {
-            method: "POST",
-            headers: {
-                "Content-Type": "application/json",
-                "Authorization": `Bearer ${cleanKey}`
-            },
-            body: JSON.stringify({
-                model: "deepseek-chat",
-                messages: messages,
-                stream: false,
-                temperature: 1.0, 
-                max_tokens: 4096,
-                response_format: { type: 'json_object' }
-            })
-        });
+    // 4. 状态机判断
+    let action: 'BUY' | 'SELL' | 'HOLD' | 'CLOSE' = 'HOLD';
+    let slPrice = 0;
+    let reason = "";
 
-        if (!response.ok) {
-            const errText = await response.text();
-            throw new Error(`DeepSeek API Error: ${response.status} - ${errText}`);
+    const primaryPos = accountData.positions.find(p => p.instId === INSTRUMENT_ID);
+
+    // 4.1 趋势反转风控 (如果持仓方向与大趋势相反，强制平仓)
+    if (primaryPos) {
+        if (isUpTrend && primaryPos.posSide === 'short') {
+            return { action: 'CLOSE', reason: "🚨 1H 趋势反转为多头，空单止损离场", sl: 0, isUpTrend };
         }
-
-        const json = await response.json();
-        return json.choices[0].message.content;
-    } catch (e: any) {
-        throw new Error(e.message || "DeepSeek 请求失败");
+        if (!isUpTrend && primaryPos.posSide === 'long') {
+             return { action: 'CLOSE', reason: "🚨 1H 趋势反转为空头，多单止损离场", sl: 0, isUpTrend };
+        }
     }
+
+    // 4.2 入场逻辑
+    // 需要至少两个交叉信号才能构成 "死叉->金叉" 或 "金叉->死叉"
+    if (!primaryPos && crosses.length >= 2) {
+        const lastCross = crosses[crosses.length - 1]; // 最新交叉
+        const prevCross = crosses[crosses.length - 2]; // 前一个交叉
+        
+        // 信号新鲜度检查: 最新交叉必须发生在最近 2 根K线内，否则视为错过机会
+        const candlesAgo = c3m.length - 1 - lastCross.index;
+        const isFresh = candlesAgo <= 2; 
+
+        if (isFresh) {
+            if (isUpTrend) {
+                // 做多逻辑: 死叉(回调) -> 金叉(启动)
+                if (prevCross.type === 'DEAD' && lastCross.type === 'GOLDEN') {
+                    // 止损计算: 两个交叉之间的最低价
+                    let minLow = Number.MAX_VALUE;
+                    for (let i = prevCross.index; i <= lastCross.index; i++) {
+                        if (lows3m[i] < minLow) minLow = lows3m[i];
+                    }
+                    // 安全边际: 稍微下移 0.05%
+                    slPrice = minLow * 0.9995;
+                    action = 'BUY';
+                    reason = `⚡ 信号触发: 1H看涨 + 3m完成回调(死叉转金叉)。区间最低价 ${minLow}`;
+                }
+            } else {
+                // 做空逻辑: 金叉(反弹) -> 死叉(下跌)
+                if (prevCross.type === 'GOLDEN' && lastCross.type === 'DEAD') {
+                    // 止损计算: 两个交叉之间的最高价
+                    let maxHigh = Number.MIN_VALUE;
+                    for (let i = prevCross.index; i <= lastCross.index; i++) {
+                        if (highs3m[i] > maxHigh) maxHigh = highs3m[i];
+                    }
+                    // 安全边际
+                    slPrice = maxHigh * 1.0005;
+                    action = 'SELL';
+                    reason = `⚡ 信号触发: 1H看跌 + 3m完成反弹(金叉转死叉)。区间最高价 ${maxHigh}`;
+                }
+            }
+        }
+    }
+
+    if (action === 'HOLD') {
+        reason = `监控中... ${trendDesc} | 3m最新信号: ${crosses.length > 0 ? crosses[crosses.length-1].type : '无'} (Ago: ${crosses.length > 0 ? c3m.length - crosses[crosses.length-1].index : '-'})`;
+    }
+
+    return { action, reason, sl: slPrice, isUpTrend };
 };
 
-export const testConnection = async (apiKey: string): Promise<string> => {
-  if (!apiKey) throw new Error("API Key 为空");
-  try {
-    const content = await callDeepSeek(apiKey, [
-        { role: "user", content: "Please respond with a JSON object containing the message 'OK'." }
-    ]);
-    return content || "无响应内容";
-  } catch (e: any) {
-    throw new Error(e.message || "连接失败");
-  }
+// --- 管理逻辑: 保本损与移动止盈 ---
+const calculateManagement = (pos: any, c3m: CandleData[]) => {
+    if (!pos) return null;
+    const entryPx = parseFloat(pos.avgPx);
+    const markPx = parseFloat(pos.avgPx) + (parseFloat(pos.upl) / (parseFloat(pos.pos) * CONTRACT_VAL_ETH)); // 估算当前标记价格
+    const currentSL = parseFloat(pos.slTriggerPx || "0");
+    
+    // 移动止盈参数
+    const lookback = 5; // 跟踪最近5根K线极值
+    const recentCandles = c3m.slice(-lookback);
+    
+    let newSL = 0;
+    let reason = "";
+
+    // 多单管理
+    if (pos.posSide === 'long') {
+        // 1. 保本损逻辑: 如果收益超过 100% (这里简化为 UPL > 保证金的一半 或者 价格上涨超过一定幅度)
+        // 假设初始止损距离是 entry * 0.5%，如果盈利达到这个距离，移动止损到入场价
+        const dist = entryPx * 0.005; 
+        if (markPx > entryPx + dist && (currentSL < entryPx)) {
+            newSL = entryPx; // 保本
+            reason = "💰 触发保本止损设置";
+        }
+        // 2. 移动止盈: 价格继续上涨，止损跟随最近5根K线的最低点
+        else {
+             const recentLow = Math.min(...recentCandles.map(c => parseFloat(c.l)));
+             const trailSL = recentLow * 0.9995; // 放在最低点下方一点
+             // 只有当新的 trailSL 高于当前 SL，且低于当前价格时才更新
+             if (trailSL > currentSL && trailSL > entryPx && trailSL < markPx) {
+                 newSL = trailSL;
+                 reason = "🚀 移动止盈跟随 (近5根低点)";
+             }
+        }
+    } 
+    // 空单管理
+    else if (pos.posSide === 'short') {
+        const dist = entryPx * 0.005;
+        if (markPx < entryPx - dist && (currentSL > entryPx || currentSL === 0)) {
+            newSL = entryPx;
+            reason = "💰 触发保本止损设置";
+        }
+        else {
+            const recentHigh = Math.max(...recentCandles.map(c => parseFloat(c.h)));
+            const trailSL = recentHigh * 1.0005;
+            // 空单 SL 向下移动 (数值变小)
+            if ((trailSL < currentSL || currentSL === 0) && trailSL < entryPx && trailSL > markPx) {
+                newSL = trailSL;
+                reason = "🚀 移动止盈跟随 (近5根高点)";
+            }
+        }
+    }
+
+    if (newSL > 0 && Math.abs(newSL - currentSL) > (entryPx * 0.0005)) {
+        return { sl: newSL.toFixed(2), reason };
+    }
+    return null;
 };
 
-// --- Main Decision Function ---
 
 export const getTradingDecision = async (
   apiKey: string,
   marketData: MarketDataCollection,
   accountData: AccountContext
 ): Promise<AIDecision> => {
-  if (!apiKey) throw new Error("请输入 DeepSeek API Key");
-
-  // --- 1. 数据准备 (Data Prep) ---
-  const currentPrice = parseFloat(marketData.ticker?.last || "0");
-  const open24h = parseFloat(marketData.ticker?.open24h || "0");
-  const vol24h = parseFloat(marketData.ticker?.volCcy24h || "0"); // USDT Volume
-  const totalEquity = parseFloat(accountData.balance.totalEq);
-  const availableEquity = parseFloat(accountData.balance.availEq);
-  const openInterest = parseFloat(marketData.openInterest || "1"); 
-
-  // K-Line Data Arrays
-  const candles = marketData.candles15m || [];
-  const closes = candles.map(c => parseFloat(c.c));
-  const highs = candles.map(c => parseFloat(c.h));
-  const lows = candles.map(c => parseFloat(c.l));
-  const volumes = candles.map(c => parseFloat(c.vol));
-
-  // --- 2. 指标计算 (Indicators) ---
   
-  const dailyChange = open24h > 0 ? ((currentPrice - open24h) / open24h) * 100 : 0;
-  const volWanShou = vol24h / 10000; 
-  const oiValue = openInterest * CONTRACT_VAL_ETH * currentPrice;
-  const turnoverRate = oiValue > 0 ? (vol24h / oiValue) * 100 : 0;
-
-  // 趋势
-  const ema20 = calcEMA(closes, 20);
-  const macdData = calcMACD(closes);
-  const macdSignalStr = macdData.hist > 0 ? "多头趋势 (MACD > Signal)" : "空头趋势 (MACD < Signal)";
+  // 1. 运行核心策略
+  const analysis = analyzeStrategy(marketData, accountData);
   
-  const boll = calcBollinger(closes, 20, 2);
-  let bollPosStr = "中轨附近";
-  if (currentPrice > boll.upper) bollPosStr = "突破上轨 (超买/强势)";
-  else if (currentPrice < boll.lower) bollPosStr = "跌破下轨 (超卖/弱势)";
-  else if (currentPrice > boll.mid) bollPosStr = "中轨上方 (偏多)";
-  else bollPosStr = "中轨下方 (偏空)";
-
-  // 振荡
-  const rsi14 = calcRSI(closes, 14);
-  const kdj = calcKDJ(highs, lows, closes, 9);
-  let kdjSignalStr = "观望";
-  if (kdj.k > 80 && kdj.d > 80) kdjSignalStr = "超买 (死叉预警)";
-  else if (kdj.k < 20 && kdj.d < 20) kdjSignalStr = "超卖 (金叉预警)";
-  else if (kdj.k > kdj.d) kdjSignalStr = "金叉向上";
-  else kdjSignalStr = "死叉向下";
-
-  // 量能
-  const vma5 = calcSMA(volumes, 5);
-  const vma10 = calcSMA(volumes, 10);
-  const volRatio = vma5 > 0 ? volumes[volumes.length - 1] / vma5 : 1;
-  const volRatioStr = volRatio.toFixed(2);
-
-  // --- 3. 账户与阶段 ---
-  const primaryPosition = accountData.positions.find(p => p.instId === INSTRUMENT_ID);
-  const hasPosition = !!primaryPosition && parseFloat(primaryPosition.pos) > 0;
+  // 2. 运行持仓管理 (如果有持仓且策略没让平仓)
+  let mgmtAction = null;
+  const primaryPos = accountData.positions.find(p => p.instId === INSTRUMENT_ID);
   
-  let stageName = "";
-  let currentStageParams = null;
-  let stagePromptAddition = "";
-
-  if (totalEquity < 20) {
-      stageName = STRATEGY_STAGES.STAGE_1.name;
-      currentStageParams = STRATEGY_STAGES.STAGE_1;
-      stagePromptAddition = "【起步搏杀阶段】允许 **高风险高收益** 操作。支持亏损补仓 (DCA) 和 盈利加仓 (Pyramiding)。";
-  } else if (totalEquity < 80) {
-      stageName = STRATEGY_STAGES.STAGE_2.name;
-      currentStageParams = STRATEGY_STAGES.STAGE_2;
-      stagePromptAddition = "【资金积累阶段】稳健增长，允许少量补仓和加仓。";
-  } else {
-      stageName = STRATEGY_STAGES.STAGE_3.name;
-      currentStageParams = STRATEGY_STAGES.STAGE_3;
-      stagePromptAddition = "【稳健盈利阶段】保本第一，禁止逆势补仓。";
+  if (primaryPos && analysis.action === 'HOLD') {
+      mgmtAction = calculateManagement(primaryPos, marketData.candles3m);
   }
 
-  let positionStr = "当前无持仓 (Empty)";
-  let avgPx = 0;
-  
-  // Dynamic SL Levels Calculation based on Net PnL (Amount)
-  let safeBreakEvenPrice = 0;
-  let recommendedSL = 0;
-  let profitLockStage = "A: 观察/浮亏期";
-  let netPnL = 0;
-  let netROI = 0;
-  let opSuggestion = "暂无建议";
-  
-  if (hasPosition) {
-      const p = primaryPosition!;
-      avgPx = parseFloat(p.avgPx);
-      const upl = parseFloat(p.upl);
-      const posSize = parseFloat(p.pos);
-      const margin = parseFloat(p.margin);
-      const isLong = p.posSide === 'long';
+  // 3. 整合决策
+  let finalAction = analysis.action;
+  let finalSL = analysis.sl > 0 ? analysis.sl.toFixed(2) : "0";
+  let finalReason = analysis.reason;
+
+  if (mgmtAction) {
+      finalAction = 'UPDATE_TPSL';
+      finalSL = mgmtAction.sl;
+      finalReason = mgmtAction.reason;
+  }
+
+  // 4. 计算仓位大小 (Risk Based)
+  let size = "0";
+  if (finalAction === 'BUY' || finalAction === 'SELL') {
+      const avail = parseFloat(accountData.balance.availEq);
+      const riskPerTrade = avail * 0.05; // 单笔亏损不超过本金 5%
+      const entry = parseFloat(marketData.ticker?.last || "0");
+      const stopDist = Math.abs(entry - parseFloat(finalSL));
       
-      // 1. 计算实际净收益 (Net PnL)
-      const positionValue = posSize * CONTRACT_VAL_ETH * currentPrice;
-      const estimatedFee = positionValue * 0.0012; 
-      netPnL = upl - estimatedFee;
-      netROI = margin > 0 ? (netPnL / margin) * 100 : 0;
-
-      // 2. 获取交易所保本价 (Use OKX breakEvenPx if available, otherwise estimate)
-      let rawBreakEven = p.breakEvenPx ? parseFloat(p.breakEvenPx) : 0;
-      if (rawBreakEven === 0) {
-          rawBreakEven = isLong ? avgPx * 1.0012 : avgPx * 0.9988;
-      }
-      safeBreakEvenPrice = rawBreakEven;
-
-      const buffer = currentPrice * 0.002;
-
-      // 3. 利润/亏损阶段判断 (Refined Step-Ladder Logic - More Aggressive Protection)
-      if (netPnL <= 0) {
-          // --- 亏损风控逻辑 ---
-          const isTrendAligned = isLong 
-              ? (currentPrice > ema20 && macdData.hist > -5) 
-              : (currentPrice < ema20 && macdData.hist < 5);
-          
-          const canDCA = currentStageParams.allow_dca || (currentStageParams as any).allow_pyramiding;
-          const currentPosRatio = positionValue / totalEquity;
-          const maxPosRatio = (currentStageParams as any).max_pos_ratio || 2.0;
-          const hasSpaceForDCA = currentPosRatio < maxPosRatio;
-          
-          const drawdownPct = Math.abs((currentPrice - avgPx) / avgPx) * 100;
-
-          if (isTrendAligned) {
-              if (canDCA && hasSpaceForDCA && drawdownPct > 1.5 && drawdownPct < 8) {
-                  profitLockStage = "A1: 良性回调 (建议补仓 DCA)";
-                  opSuggestion = isLong ? `建议 BUY (补仓) ${posSize * 0.5} 张` : `建议 SELL (补仓) ${posSize * 0.5} 张`;
-                  recommendedSL = 0; 
-              } else {
-                  profitLockStage = "A1: 正常震荡 (HOLD, 允许浮亏)";
-                  opSuggestion = "暂不补仓 (幅度不够或仓位已满)";
-                  recommendedSL = 0; 
-              }
-          } else {
-              profitLockStage = "A2: 趋势转弱 (风控预警)";
-              opSuggestion = "禁止补仓 (趋势破坏)";
-              recommendedSL = isLong 
-                  ? Math.max(parseFloat(p.slTriggerPx || "0"), currentPrice * 0.99) 
-                  : Math.min(parseFloat(p.slTriggerPx || "999999"), currentPrice * 1.01); 
-          }
+      if (stopDist > 0) {
+          const coinSize = riskPerTrade / stopDist; // 风险平衡数量 (ETH)
+          // 转换为合约张数 (1张 = 0.1 ETH)
+          const contracts = coinSize / CONTRACT_VAL_ETH;
+          size = Math.floor(contracts).toString(); // 取整
+          if (parseFloat(size) < 1) size = "1"; // 最小1张
       } else {
-          // --- 盈利管理逻辑 (高频保护 Aggressive Protection) ---
-          
-          const distToBE = isLong ? (currentPrice - safeBreakEvenPrice) : (safeBreakEvenPrice - currentPrice);
-          // Profit Distance from BE
-          // We use Net ROI for stage determination to be precise on capital
-          
-          if (netROI < 2.0) {
-              // B1: 微利保本区 (Net ROI 0% ~ 2%) -> 立即保本
-              // 只要净收益为正，就立刻把止损提到保本价，不给市场反悔机会
-              profitLockStage = "B1: 立即保本 (Net PnL > 0)";
-              recommendedSL = safeBreakEvenPrice;
-              opSuggestion = "防御优先：调整止损至保本价";
-          } else if (netROI >= 2.0 && netROI < 5.0) {
-              // C1: 锁定小利 (2% ~ 5%) -> 锁定 30% 利润
-              profitLockStage = "C1: 锁定小利 (Lock 30%)";
-              const lockAmt = distToBE * 0.30;
-              recommendedSL = isLong ? safeBreakEvenPrice + lockAmt : safeBreakEvenPrice - lockAmt;
-              opSuggestion = "锁定 30% 浮盈";
-          } else if (netROI >= 5.0 && netROI < 10.0) {
-              // C2: 锁定中利 (5% ~ 10%) -> 锁定 50% 利润
-              profitLockStage = "C2: 锁定中利 (Lock 50%)";
-              const lockAmt = distToBE * 0.50;
-              recommendedSL = isLong ? safeBreakEvenPrice + lockAmt : safeBreakEvenPrice - lockAmt;
-              opSuggestion = "锁定 50% 浮盈";
-          } else {
-              // D: 深度获利 (> 10%) -> 锁定 80% 利润 (High Retention)
-              profitLockStage = "D: 深度止盈 (Lock 80%)";
-              const lockAmt = distToBE * 0.80;
-              recommendedSL = isLong ? safeBreakEvenPrice + lockAmt : safeBreakEvenPrice - lockAmt;
-              opSuggestion = "强趋势跟进 (Let Profits Run)";
-          }
-
-          // Pyramiding Logic
-          const isStrongTrend = isLong
-              ? (currentPrice > boll.upper || (macdData.hist > 0 && rsi14 > 55))
-              : (currentPrice < boll.lower || (macdData.hist < 0 && rsi14 < 45));
-          
-          const currentPosRatio = positionValue / totalEquity;
-          const maxPosRatio = (currentStageParams as any).max_pos_ratio || 2.0;
-          const hasSpace = currentPosRatio < maxPosRatio;
-
-          if (isStrongTrend && hasSpace && netROI > 10) {
-               opSuggestion += " & 建议顺势加仓";
-          }
+          size = "1";
       }
-
-      // 4. 棘轮效应 (Strict Ratchet) - 确保止损不回撤
-      const currentSL = p.slTriggerPx ? parseFloat(p.slTriggerPx) : 0;
-      if (recommendedSL > 0) {
-          if (isLong) {
-               if (recommendedSL > currentPrice - buffer) recommendedSL = currentPrice - buffer; // 挂单安全距离
-               // 棘轮: 新止损必须 >= 旧止损
-               if (currentSL > 0 && recommendedSL < currentSL) {
-                   console.log(`[Ratchet] 修正: 新止损 ${recommendedSL.toFixed(2)} < 旧止损 ${currentSL}，维持旧止损`);
-                   recommendedSL = currentSL; 
-                   profitLockStage += " [棘轮保持]";
-               }
-          } else { 
-               if (recommendedSL < currentPrice + buffer) recommendedSL = currentPrice + buffer;
-               // 棘轮: 新止损必须 <= 旧止损
-               if (currentSL > 0 && recommendedSL > currentSL) {
-                   console.log(`[Ratchet] 修正: 新止损 ${recommendedSL.toFixed(2)} > 旧止损 ${currentSL}，维持旧止损`);
-                   recommendedSL = currentSL;
-                   profitLockStage += " [棘轮保持]";
-               }
-          }
+      
+      // 杠杆保护: 限制名义价值不超过 20倍杠杆
+      const maxNotional = avail * 20;
+      const currentNotional = parseFloat(size) * CONTRACT_VAL_ETH * entry;
+      if (currentNotional > maxNotional) {
+          size = Math.floor(maxNotional / (CONTRACT_VAL_ETH * entry)).toString();
       }
-
-      positionStr = `
-      持有: ${p.posSide.toUpperCase()} ${p.pos}张
-      开仓均价: ${p.avgPx} | 当前价格: ${currentPrice}
-      ----------------------------------------
-      【实际收益分析】
-      * 净盈亏 (Net PnL): ${netPnL.toFixed(2)} U (${netROI.toFixed(2)}% ROI)
-      ----------------------------------------
-      【风控与操作建议】
-      * 交易所保本价: ${safeBreakEvenPrice.toFixed(2)}
-      * 当前阶段: ${profitLockStage}
-      * 操作建议: ${opSuggestion}
-      * 推荐止损 (棘轮修正后): ${recommendedSL > 0 ? recommendedSL.toFixed(2) : "无"}
-      ----------------------------------------
-      当前生效止损 (SL): ${p.slTriggerPx || "⚠️未设置"}
-      技术面: EMA20=${ema20.toFixed(2)}, MACD Hist=${macdData.hist.toFixed(2)}
-      `;
   }
 
-  // --- 4. 构建 Prompt (Rich Format) ---
-  
-  const marketDataBlock = `
-价格数据:
-- 收盘价：${currentPrice.toFixed(2)}
-- 日内波动率：${dailyChange.toFixed(2)}%
-- 成交量：${volWanShou.toFixed(0)}万 (24H Value)
-- 市场活跃度(换手率)：${turnoverRate.toFixed(2)}%
-
-技术面数据 (15m):
-趋势指标:
-- MACD信号：${macdSignalStr} (Diff: ${macdData.macd.toFixed(2)})
-- 布林带：${bollPosStr} (Up: ${boll.upper.toFixed(2)}, Low: ${boll.lower.toFixed(2)})
-
-超买超卖:
-- RSI(14)：${rsi14.toFixed(2)}
-- KDJ信号：${kdjSignalStr} (K:${kdj.k.toFixed(1)}, D:${kdj.d.toFixed(1)})
-
-量能:
-- 量比：${volRatioStr} (当前Vol / MA5)
-`;
-
-  const systemPrompt = `
-你是一名专注于ETH合约的 **超短线战神策略交易员**。
-你拥有全面的市场数据，并具备 **实时联网搜索能力 (Real-Time Web Search)**。
-
-**一、全面行情分析数据**:
-${marketDataBlock}
-
-**二、当前账户状态**:
-- **阶段**: ${stageName}
-- **策略偏好**: ${stagePromptAddition}
-- **余额**: ${availableEquity.toFixed(2)} U
-- **持仓状态**: ${positionStr}
-
-**三、核心决策指令 (HIGHEST PRIORITY: AGGRESSIVE PROFIT PROTECTION)**:
-
-1. **激进的利润保护 (Aggressive Protection Rules)**:
-   - **核心原则**: 只要【净盈亏 (Net PnL)】> 0，哪怕只有微利，也要立即建立防线！
-   - **执行逻辑**: 请严格参考【风控与操作建议】中的 **推荐止损**。
-     - 如果推荐值 > 0 且与当前 SL 不同，**必须** 发出 **UPDATE_TPSL** 指令。
-     - 哪怕只是将止损上移 0.5U，也是对本金负责。
-   - **棘轮规则**: 严禁回调止损！只允许向更有利于盈利的方向移动。
-
-2. **首次开仓风控 (Initial Entry Rules)**:
-   - **最小金额门槛**: 首次开仓的 **占用保证金** 必须 >= 0.5 USDT。
-   - **最大止损**: 首次开仓止损造成的亏损，**绝不允许超过保证金 20%**。
-
-3. **补仓与加仓机制 (Dynamic Sizing)**:
-   - **亏损补仓 (DCA)**: 仅在趋势未破时（A1阶段）允许，按需补仓。
-   - **盈利加仓 (Pyramiding)**: 仅在趋势强劲且已锁定部分利润时允许。
-
-4. **实时联网搜索 (ONLINE SEARCH)**:
-   - **指令**: 立即搜索全网 Crypto 热点 (6h/24h)。
-   - **判断**: 若有突发重大利空，立即清仓。
-
-5. **交易执行**:
-   - **Action**: BUY / SELL / HOLD / CLOSE / UPDATE_TPSL
-   - **Stop Loss**: 
-      - UPDATE_TPSL: 填入【推荐止损】的数值。
-      - 开新仓/补仓: 必须填入逻辑止损，且符合风控要求。
-
-请生成纯净的 JSON 格式交易决策。
-`;
-
-  const responseSchema = `
-  {
-    "stage_analysis": "...",
-    "hot_events_overview": "【联网搜索结果】...",
-    "market_assessment": "...",
-    "eth_analysis": "...", 
-    "trading_decision": {
-      "action": "BUY|SELL|HOLD|CLOSE|UPDATE_TPSL",
-      "confidence": "0-100%",
-      "position_size": "动态计算 (张数或U)",
-      "leverage": "${currentStageParams.leverage}",
-      "profit_target": "价格",
-      "stop_loss": "价格 (注意 <20% 亏损限制)",
-      "invalidation_condition": "..."
+  return {
+    stage_analysis: analysis.isUpTrend ? "📈 上涨趋势 (1H)" : "📉 下跌趋势 (1H)",
+    market_assessment: "策略监控运行中...",
+    hot_events_overview: "Algo Mode",
+    eth_analysis: "基于 1H EMA15/60 趋势 & 3m K线形态",
+    trading_decision: {
+        action: finalAction as any,
+        confidence: "100%",
+        position_size: size,
+        leverage: "10", 
+        profit_target: "0", // 动态止盈
+        stop_loss: finalSL,
+        invalidation_condition: "趋势反转"
     },
-    "reasoning": "..."
-  }
-  `;
+    reasoning: finalReason,
+    action: finalAction as any,
+    size: size,
+    leverage: "10"
+  };
+};
 
-  try {
-    const text = await callDeepSeek(apiKey, [
-        { role: "system", content: systemPrompt + "\nJSON ONLY, NO MARKDOWN:\n" + responseSchema },
-        { role: "user", content: "请调用你的搜索能力获取实时数据，并根据【激进利润保护】逻辑给出指令。" }
-    ]);
-
-    if (!text) throw new Error("AI 返回为空");
-
-    // Parse JSON
-    let decision: AIDecision;
-    try {
-        const cleanText = text.replace(/```json/g, '').replace(/```/g, '').trim();
-        decision = JSON.parse(cleanText);
-    } catch (e) {
-        console.error("JSON Parse Failed:", text);
-        throw new Error("AI 返回格式错误");
-    }
-
-    // --- Post-Processing & Validation ---
-    decision.action = decision.trading_decision.action.toUpperCase() as any;
-    
-    const leverage = parseFloat(decision.trading_decision.leverage);
-    const confidence = parseFloat(decision.trading_decision.confidence) || 50;
-    const safeLeverage = isNaN(leverage) ? currentStageParams.leverage : leverage;
-    
-    // Robust Sizing Logic
-    let targetMargin = availableEquity * currentStageParams.risk_factor * (confidence / 100);
-    const maxSafeMargin = availableEquity * 0.95; 
-    let finalMargin = Math.min(targetMargin, maxSafeMargin);
-
-    let positionValue = finalMargin * safeLeverage;
-
-    // --- 强制修正：首仓保证金检查 (Min Margin 0.5U) ---
-    const isInitialOpen = !hasPosition;
-    const MIN_MARGIN = 0.5;
-
-    if (isInitialOpen && finalMargin < MIN_MARGIN) {
-        if (availableEquity > MIN_MARGIN * 1.05) {
-            finalMargin = MIN_MARGIN;
-            positionValue = finalMargin * safeLeverage;
-            console.log(`[AI] 首次开仓强制修正: 保证金提升至 ${MIN_MARGIN} USDT (市值: ${positionValue.toFixed(2)})`);
-        } else {
-            console.warn(`[AI] 首次开仓资金不足 (${availableEquity.toFixed(2)} < ${MIN_MARGIN})，无法满足0.5U保证金，转为HOLD`);
-            decision.action = 'HOLD';
-            decision.size = "0";
-            decision.reasoning += ` [系统修正: 资金不足以满足最小0.5U保证金要求]`;
-        }
-    }
-
-    // --- 强制风控检查 (Max SL Distance) ---
-    if (decision.action === 'BUY' || decision.action === 'SELL') {
-        let rawSize = parseFloat(decision.trading_decision.position_size || "0");
-        const calcSize = positionValue / (CONTRACT_VAL_ETH * currentPrice);
-        
-        let finalSize = calcSize;
-        if (rawSize > 0 && rawSize < calcSize) {
-            finalSize = rawSize;
-        } else if (rawSize === 0) {
-            finalSize = calcSize;
-        }
-
-        // SL Protection Check
-        const proposedSL = parseFloat(decision.trading_decision.stop_loss);
-        if (!isNaN(proposedSL) && proposedSL > 0) {
-            const maxDeviationPct = 0.20 / safeLeverage; 
-            let safeSL = proposedSL;
-            let corrected = false;
-
-            if (decision.action === 'BUY') {
-                const limitPrice = currentPrice * (1 - maxDeviationPct);
-                if (proposedSL < limitPrice) {
-                    safeSL = limitPrice;
-                    corrected = true;
-                }
-            } else { // SELL
-                const limitPrice = currentPrice * (1 + maxDeviationPct);
-                if (proposedSL > limitPrice) {
-                    safeSL = limitPrice;
-                    corrected = true;
-                }
-            }
-
-            if (corrected) {
-                console.warn(`[Risk Control] AI SL ${proposedSL} too loose. Adjusted to ${safeSL.toFixed(2)}`);
-                decision.trading_decision.stop_loss = safeSL.toFixed(2);
-                decision.reasoning += ` [系统修正: 止损已强制收紧至 ${safeSL.toFixed(2)} 以控制本金亏损 <20%]`;
-            }
-        }
-
-        const numContracts = Math.floor(finalSize * 100) / 100;
-        if (numContracts < 0.01) {
-            decision.action = 'HOLD';
-            decision.size = "0";
-        } else {
-            decision.size = numContracts.toFixed(2);
-            decision.leverage = safeLeverage.toString();
-        }
-    } else {
-        decision.size = "0";
-        decision.leverage = safeLeverage.toString();
-    }
-
-    return decision;
-
-  } catch (error: any) {
-    console.error("AI Decision Error:", error);
-    return {
-        stage_analysis: "AI Error",
-        market_assessment: "Unknown",
-        hot_events_overview: "N/A",
-        eth_analysis: "N/A",
-        trading_decision: {
-            action: 'hold' as any,
-            confidence: "0%",
-            position_size: "0",
-            leverage: "0",
-            profit_target: "0",
-            stop_loss: "0",
-            invalidation_condition: "Error"
-        },
-        reasoning: "System Error: " + error.message,
-        action: 'HOLD',
-        size: "0",
-        leverage: "0"
-    };
-  }
+export const testConnection = async (apiKey: string) => {
+    return "Local Strategy Engine: OK";
 };
