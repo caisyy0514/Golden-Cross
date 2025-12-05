@@ -55,8 +55,8 @@ const runTradingLoop = async () => {
 
     // 2. AI Analysis Logic
     const now = Date.now();
-    // Analyze every 60 seconds (1 minute)
-    if (now - lastAnalysisTime < 60000) return;
+    // Analyze every 30 seconds (0.5 minute)
+    if (now - lastAnalysisTime < 30000) return;
 
     // Use setTimeout instead of setImmediate to avoid TS errors
     setTimeout(async () => {
