@@ -24,10 +24,11 @@ const calculateEMA = (data: any[], period: number) => {
 };
 
 const CandleChart: React.FC<Props> = ({ data }) => {
-  const chartData = useMemo(() => {
+  // 1. Process full data for accurate EMA calculation
+  const processedData = useMemo(() => {
     if(!data || data.length === 0) return [];
 
-    const processed = data.map(d => ({
+    const raw = data.map(d => ({
       timeRaw: parseInt(d.ts),
       time: new Date(parseInt(d.ts)).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'}),
       o: parseFloat(d.o),
@@ -37,11 +38,11 @@ const CandleChart: React.FC<Props> = ({ data }) => {
       vol: parseFloat(d.vol),
     }));
 
-    // Calculate EMAs based on this specific timeframe data
-    const ema15 = calculateEMA(processed, 15);
-    const ema60 = calculateEMA(processed, 60);
+    // Calculate EMAs based on ALL available data
+    const ema15 = calculateEMA(raw, 15);
+    const ema60 = calculateEMA(raw, 60);
 
-    return processed.map((item, i) => ({
+    return raw.map((item, i) => ({
       ...item,
       ema15: ema15[i],
       ema60: ema60[i],
@@ -49,17 +50,32 @@ const CandleChart: React.FC<Props> = ({ data }) => {
     }));
   }, [data]);
 
+  // 2. Slice specific range for Display (Fixed Zoom Level)
+  // Showing last 80 candles ensures candles are readable and not too thin
+  const visibleData = useMemo(() => {
+      return processedData.slice(-80);
+  }, [processedData]);
+
+  // 3. Dynamic Y-Axis Domain based ONLY on VISIBLE data
   const yDomain = useMemo(() => {
-    if (chartData.length === 0) return ['auto', 'auto'];
-    // Focus domain on recent prices
-    const slice = chartData.slice(-50); 
-    const lows = slice.map(d => d.l);
-    const highs = slice.map(d => d.h);
-    const min = Math.min(...lows);
-    const max = Math.max(...highs);
-    const padding = (max - min) * 0.1; 
+    if (visibleData.length === 0) return ['auto', 'auto'];
+    
+    let min = Infinity;
+    let max = -Infinity;
+
+    visibleData.forEach(d => {
+        if (d.l < min) min = d.l;
+        if (d.h > max) max = d.h;
+        // Include EMA in domain so lines don't get cut off
+        if (d.ema15 && d.ema15 < min) min = d.ema15;
+        if (d.ema15 && d.ema15 > max) max = d.ema15;
+        if (d.ema60 && d.ema60 < min) min = d.ema60;
+        if (d.ema60 && d.ema60 > max) max = d.ema60;
+    });
+
+    const padding = (max - min) * 0.15; // 15% Padding for better aesthetics
     return [min - padding, max + padding];
-  }, [chartData]);
+  }, [visibleData]);
 
   const CandleStickShape = (props: any) => {
     const { x, width, payload, yAxis } = props;
@@ -75,25 +91,40 @@ const CandleChart: React.FC<Props> = ({ data }) => {
     const color = isUp ? '#10b981' : '#ef4444'; 
     const bodyHeight = Math.max(Math.abs(open - close), 1);
     const bodyY = Math.min(open, close);
+    // Add gap between candles
+    const candleWidth = Math.max(width - 2, 2); 
+    const candleX = x + (width - candleWidth) / 2;
     const centerX = x + width / 2;
 
     return (
       <g>
-        <line x1={centerX} y1={high} x2={centerX} y2={low} stroke={color} strokeWidth={1} />
-        <rect x={x} y={bodyY} width={width} height={bodyHeight} fill={color} stroke={color} />
+        <line x1={centerX} y1={high} x2={centerX} y2={low} stroke={color} strokeWidth={1} opacity={0.8} />
+        <rect x={candleX} y={bodyY} width={candleWidth} height={bodyHeight} fill={color} stroke="none" rx={1} />
       </g>
     );
   };
 
   return (
     <div className="w-full h-full select-none relative">
-      <div className="absolute top-2 left-4 text-xs font-mono z-10 flex gap-4 pointer-events-none bg-black/50 p-1 rounded">
-          <span className="text-yellow-400 font-bold">EMA 15</span>
-          <span className="text-blue-400 font-bold">EMA 60</span>
+      <div className="absolute top-2 left-4 text-xs font-mono z-10 flex gap-4 pointer-events-none bg-black/40 backdrop-blur-sm p-1.5 rounded border border-white/5">
+          <div className="flex items-center gap-1.5">
+            <div className="w-2 h-2 rounded-full bg-yellow-400"></div>
+            <span className="text-gray-300 font-bold">EMA 15</span>
+          </div>
+          <div className="flex items-center gap-1.5">
+            <div className="w-2 h-2 rounded-full bg-blue-400"></div>
+            <span className="text-gray-300 font-bold">EMA 60</span>
+          </div>
       </div>
       <ResponsiveContainer width="100%" height="100%">
-        <ComposedChart data={chartData} margin={{ top: 10, right: 10, left: 0, bottom: 0 }}>
-          <CartesianGrid stroke="#27272a" strokeDasharray="3 3" vertical={false} />
+        <ComposedChart data={visibleData} margin={{ top: 10, right: 10, left: 0, bottom: 0 }}>
+          <defs>
+            <linearGradient id="volGradient" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="5%" stopColor="#27272a" stopOpacity={0.5}/>
+              <stop offset="95%" stopColor="#27272a" stopOpacity={0}/>
+            </linearGradient>
+          </defs>
+          <CartesianGrid stroke="#27272a" strokeDasharray="3 3" vertical={false} opacity={0.5} />
           
           <XAxis 
             dataKey="time" 
@@ -101,7 +132,7 @@ const CandleChart: React.FC<Props> = ({ data }) => {
             tick={{fontSize: 10, fill: '#71717a'}} 
             tickLine={false}
             axisLine={false}
-            minTickGap={30}
+            minTickGap={40}
           />
           
           <YAxis 
@@ -115,26 +146,30 @@ const CandleChart: React.FC<Props> = ({ data }) => {
             width={50}
           />
 
-          <YAxis yAxisId="volume" orientation="left" domain={[0, (dataMax: number) => dataMax * 4]} hide />
+          <YAxis yAxisId="volume" orientation="left" domain={[0, (dataMax: number) => dataMax * 5]} hide />
 
           <Tooltip 
-            contentStyle={{backgroundColor: '#18181b', borderColor: '#27272a', borderRadius: '8px', fontSize: '12px'}}
-            labelStyle={{color: '#a1a1aa'}}
+            cursor={{ stroke: '#52525b', strokeWidth: 1, strokeDasharray: '4 4' }}
+            contentStyle={{backgroundColor: '#18181b', borderColor: '#27272a', borderRadius: '8px', fontSize: '12px', padding: '8px'}}
+            labelStyle={{color: '#a1a1aa', marginBottom: '4px'}}
             content={({ active, payload, label }) => {
                 if (active && payload && payload.length) {
                     const data = payload[0].payload;
                     return (
-                        <div className="bg-okx-card border border-okx-border p-2 rounded shadow-xl text-xs z-50">
-                            <div className="text-gray-400 mb-1">{label} (3m)</div>
-                            <div className="grid grid-cols-2 gap-x-4 gap-y-1">
-                                <span className="text-gray-400">Close:</span>
-                                <span className={data.isUp ? 'text-okx-up' : 'text-okx-down'}>{data.c}</span>
-                                <span className="text-gray-400">Vol:</span>
-                                <span>{data.vol}</span>
-                            </div>
-                            <div className="mt-2 pt-2 border-t border-gray-700 flex flex-col gap-1">
-                                <div className="text-yellow-400">EMA15: {data.ema15?.toFixed(2)}</div>
-                                <div className="text-blue-400">EMA60: {data.ema60?.toFixed(2)}</div>
+                        <div className="bg-okx-card border border-okx-border p-3 rounded-lg shadow-xl text-xs z-50 min-w-[140px]">
+                            <div className="text-gray-400 mb-2 font-mono border-b border-gray-800 pb-1">{label}</div>
+                            <div className="grid grid-cols-2 gap-x-4 gap-y-1.5 font-mono">
+                                <span className="text-gray-500">Price</span>
+                                <span className={data.isUp ? 'text-okx-up' : 'text-okx-down'}>{data.c.toFixed(2)}</span>
+                                
+                                <span className="text-gray-500">EMA15</span>
+                                <span className="text-yellow-400">{data.ema15?.toFixed(2)}</span>
+                                
+                                <span className="text-gray-500">EMA60</span>
+                                <span className="text-blue-400">{data.ema60?.toFixed(2)}</span>
+                                
+                                <span className="text-gray-500">Vol</span>
+                                <span className="text-gray-300">{data.vol.toLocaleString()}</span>
                             </div>
                         </div>
                     );
@@ -144,15 +179,31 @@ const CandleChart: React.FC<Props> = ({ data }) => {
           />
 
           <Bar dataKey="vol" yAxisId="volume" barSize={4}>
-             {chartData.map((entry, index) => (
-                <Cell key={`cell-${index}`} fill={entry.isUp ? '#10b981' : '#ef4444'} opacity={0.3} />
+             {visibleData.map((entry, index) => (
+                <Cell key={`cell-${index}`} fill={entry.isUp ? '#10b981' : '#ef4444'} opacity={0.15} />
              ))}
           </Bar>
 
           <Bar dataKey="h" shape={(props: any) => <CandleStickShape {...props} />} isAnimationActive={false} />
 
-          <Line type="monotone" dataKey="ema15" stroke="#facc15" strokeWidth={2} dot={false} isAnimationActive={false} />
-          <Line type="monotone" dataKey="ema60" stroke="#60a5fa" strokeWidth={2} dot={false} isAnimationActive={false} />
+          <Line 
+            type="monotone" 
+            dataKey="ema15" 
+            stroke="#facc15" 
+            strokeWidth={1.5} 
+            dot={false} 
+            activeDot={{r: 4, strokeWidth: 0}}
+            isAnimationActive={false} 
+          />
+          <Line 
+            type="monotone" 
+            dataKey="ema60" 
+            stroke="#60a5fa" 
+            strokeWidth={1.5} 
+            dot={false} 
+            activeDot={{r: 4, strokeWidth: 0}}
+            isAnimationActive={false} 
+          />
 
         </ComposedChart>
       </ResponsiveContainer>
