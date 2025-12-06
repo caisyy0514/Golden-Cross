@@ -1,4 +1,3 @@
-
 import React, { useState, useEffect, useCallback } from 'react';
 import { Settings, Play, Pause, RefreshCw, Activity, Zap, TrendingUp, AlertCircle, Terminal, Shield, Target, Brain, X, Eye, Flame, Cloud } from 'lucide-react';
 import { MarketDataCollection, AccountContext, AIDecision, SystemLog, AppConfig } from './types';
@@ -120,7 +119,7 @@ const App: React.FC = () => {
       <main className="p-6 grid grid-cols-12 gap-6 max-w-[1600px] mx-auto">
         
         {/* LEFT COLUMN: DATA */}
-        <div className="col-span-12 lg:col-span-3 space-y-4">
+        <div className="col-span-12 lg:col-span-3 space-y-4 h-full flex flex-col">
           {/* Market Card */}
           <div className="bg-okx-card border border-okx-border rounded-xl p-5">
             <div className="flex justify-between items-start">
@@ -151,7 +150,7 @@ const App: React.FC = () => {
           </div>
 
           {/* Position Cards */}
-          <div className="space-y-3">
+          <div className="flex-1 space-y-3">
              <div className="flex items-center gap-2 text-white font-bold text-sm px-1">
                 <Shield size={16} /> 持仓监控
              </div>
@@ -208,15 +207,15 @@ const App: React.FC = () => {
         </div>
 
         {/* MIDDLE COLUMN: CHART */}
-        <div className="col-span-12 lg:col-span-6 h-[500px] lg:h-auto bg-okx-card border border-okx-border rounded-xl p-4 flex flex-col relative">
-           <div className="absolute top-4 right-4 z-10 bg-okx-bg/80 px-2 py-1 rounded text-xs text-okx-subtext border border-okx-border">
-               Execution: 3m Chart
+        <div className="col-span-12 lg:col-span-6 h-[500px] lg:h-[600px] bg-okx-card border border-okx-border rounded-xl p-4 flex flex-col relative">
+           <div className="absolute top-4 right-4 z-10 bg-okx-bg/80 px-2 py-1 rounded text-xs text-okx-subtext border border-okx-border font-mono">
+               Timeframe: 3m
            </div>
            <CandleChart data={marketData?.candles3m || []} />
         </div>
 
         {/* RIGHT COLUMN: STRATEGY */}
-        <div className="col-span-12 lg:col-span-3 flex flex-col gap-4 h-[600px] lg:h-auto">
+        <div className="col-span-12 lg:col-span-3 flex flex-col gap-4 h-[600px] lg:h-full">
            {/* Strategy Status */}
            <div className="bg-gradient-to-b from-gray-800 to-okx-card border border-okx-border rounded-xl p-5 flex flex-col">
               <div className="flex items-center gap-2 text-purple-400 font-bold mb-3">
@@ -256,7 +255,7 @@ const App: React.FC = () => {
            </div>
 
            {/* Logs */}
-           <div className="flex-1 bg-black/40 border border-okx-border rounded-xl p-4 overflow-hidden flex flex-col">
+           <div className="flex-1 bg-black/40 border border-okx-border rounded-xl p-4 overflow-hidden flex flex-col min-h-[300px]">
              <div className="flex items-center gap-2 mb-2 text-okx-subtext text-xs uppercase tracking-wider font-semibold">
                 <Terminal size={12} /> 系统日志
              </div>
